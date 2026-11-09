@@ -1,0 +1,70 @@
+# crawl-flow 源配置
+# 每个源必须包含 name / type / base_url；page_size 只对 api 类型生效。
+sources:
+  - name: demo_api
+    type: api
+    base_url: http://127.0.0.1:8010
+    enabled: true
+    page_size: 5
+    timeout_seconds: 10
+    # 默认路径分别是 /api/items 与 /api/items/{id}，这里显式写出便于阅读
+    list_path: /api/items
+    detail_path: /api/items/{id}
+    field_map:
+      title: title
+      category: category
+      tags: tags
+      published_at: published_at
+      content: content
+      url: null
+
+  - name: demo_html
+    type: html
+    base_url: http://127.0.0.1:8010
+    enabled: true
+    page_size: 5
+    timeout_seconds: 10
+    list_path: /list
+    detail_path: /item/{id}
+    field_map:
+      title: title
+      category: category
+      tags: tags
+      published_at: published_at
+      content: content
+      url: null
+
+  # 故障演练源：详情一律返回 500，用来验证错误隔离。
+  # 默认 disabled，--all 不会带上；可显式 `--source demo_api_flaky` 运行。
+  - name: demo_api_flaky
+    type: api
+    base_url: http://127.0.0.1:8010
+    enabled: false
+    page_size: 5
+    timeout_seconds: 10
+    list_path: /api/items
+    detail_path: /api/items/{id}?fail=1
+    field_map:
+      title: title
+      category: category
+      tags: tags
+      published_at: published_at
+      content: content
+      url: null
+
+  # 故障演练源：列表页一律返回 503，用来验证「整轮失败、退出码 2」。
+  - name: demo_api_broken
+    type: api
+    base_url: http://127.0.0.1:8010
+    enabled: false
+    page_size: 5
+    timeout_seconds: 10
+    list_path: /api/items?fail=1
+    detail_path: /api/items/{id}
+    field_map:
+      title: title
+      category: category
+      tags: tags
+      published_at: published_at
+      content: content
+      url: null

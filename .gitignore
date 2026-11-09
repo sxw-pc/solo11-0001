@@ -1,0 +1,28 @@
+# 环境与密钥
+.env
+.env.*
+
+# 数据库与采集产物
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 测试与工具缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 日志
+*.log
