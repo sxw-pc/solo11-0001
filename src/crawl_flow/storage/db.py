@@ -6,13 +6,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
-from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+from crawl_flow.models import (
+    Base,
+    DeadLetter,
+    DeadLetterRow,
+    RawRecord,
+    RawRecordRow,
+    Record,
+    RecordRow,
+)
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -26,6 +34,8 @@ RECORD_UPDATE_FIELDS = (
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+
+DEAD_LETTER_UPDATE_FIELDS = ("url", "error", "attempts", "failed_at")
 
 
 def _utcnow() -> datetime:
@@ -43,7 +53,7 @@ class Database:
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def init(self) -> None:
-        """创建两张表及索引（幂等）。"""
+        """创建三张表及索引（幂等）。"""
 
         try:
             Base.metadata.create_all(self.engine)
@@ -108,6 +118,73 @@ class Database:
                 f"raw_records 写入失败 source={raw.source} "
                 f"external_id={raw.external_id} error={exc}"
             ) from exc
+
+    def upsert_dead_letter(self, letter: DeadLetter) -> None:
+        """按 (source, external_id) 幂等写入死信；重跑再次失败只更新最新信息。"""
+
+        values = {
+            "source": letter.source,
+            "external_id": letter.external_id,
+            "url": letter.url,
+            "error": letter.error,
+            "attempts": letter.attempts,
+            "failed_at": letter.failed_at,
+        }
+        try:
+            with self._session_factory() as session:
+                statement = sqlite_insert(DeadLetterRow).values(**values)
+                statement = statement.on_conflict_do_update(
+                    index_elements=["source", "external_id"],
+                    set_={field: statement.excluded[field] for field in DEAD_LETTER_UPDATE_FIELDS},
+                )
+                session.execute(statement)
+                session.commit()
+        except SQLAlchemyError as exc:
+            raise StoreError(
+                f"dead_letters 写入失败 source={letter.source} "
+                f"external_id={letter.external_id} error={exc}"
+            ) from exc
+
+    def delete_dead_letter(self, source: str, external_id: str) -> None:
+        """条目后续采集成功时移除对应死信；不存在时静默成功。"""
+
+        try:
+            with self._session_factory() as session:
+                session.execute(
+                    delete(DeadLetterRow).where(
+                        DeadLetterRow.source == source,
+                        DeadLetterRow.external_id == external_id,
+                    )
+                )
+                session.commit()
+        except SQLAlchemyError as exc:
+            raise StoreError(
+                f"dead_letters 删除失败 source={source} "
+                f"external_id={external_id} error={exc}"
+            ) from exc
+
+    def list_dead_letters(self, source: str | None = None) -> list[DeadLetter]:
+        """按源列出死信（不传则全部），按 source、failed_at 倒序排列。"""
+
+        with Session(self.engine) as session:
+            statement = select(DeadLetterRow)
+            if source is not None:
+                statement = statement.where(DeadLetterRow.source == source)
+            statement = statement.order_by(
+                DeadLetterRow.source, DeadLetterRow.failed_at.desc()
+            )
+            rows = list(session.execute(statement).scalars())
+        return [
+            DeadLetter(
+                source=row.source,
+                external_id=row.external_id,
+                url=row.url,
+                error=row.error,
+                attempts=row.attempts,
+                failed_at=row.failed_at,
+            )
+            for row in rows
+        ]
 
     def count_records(self, source: str | None = None) -> int:
         with Session(self.engine) as session:

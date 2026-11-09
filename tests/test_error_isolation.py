@@ -22,7 +22,11 @@ def test_detail_500_does_not_abort_round(
     raw_store: RawStore,
     make_source: Any,
 ) -> None:
-    flaky = make_source("demo_api_flaky", detail_path="/api/items/{id}?fail=1")
+    flaky = make_source(
+        "demo_api_flaky",
+        detail_path="/api/items/{id}?fail=1",
+        retry={"max_retries": 0},
+    )
     summary = run_source(flaky, db, raw_store, limit=3)
 
     assert (summary.ok, summary.failed, summary.skipped) == (0, 3, 12)
@@ -53,7 +57,13 @@ def test_cli_returns_zero_when_details_fail(
     tmp_path: Path,
 ) -> None:
     config_path = write_config(
-        [source_payload("demo_api_flaky", detail_path="/api/items/{id}?fail=1")]
+        [
+            source_payload(
+                "demo_api_flaky",
+                detail_path="/api/items/{id}?fail=1",
+                retry={"max_retries": 0},
+            )
+        ]
     )
     db_path = tmp_path / "cli.db"
     raw_dir = tmp_path / "cli-raw"

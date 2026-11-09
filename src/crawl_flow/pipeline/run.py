@@ -1,9 +1,10 @@
-"""采集主流程：列表翻页 → 详情抓取 → 解析 → 归一化 → 落 raw → 入库。"""
+"""采集主流程：列表翻页 → 详情抓取（含指数退避重试）→ 解析 → 归一化 → 落 raw → 入库。"""
 
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -12,9 +13,10 @@ from crawl_flow.config import SourceConfig
 from crawl_flow.errors import FetchError, ParseError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
-from crawl_flow.models import RawRecord
+from crawl_flow.models import DeadLetter, RawRecord, Record
 from crawl_flow.observability.logging import log_item
 from crawl_flow.pipeline.normalize import normalize_record
+from crawl_flow.pipeline.retry import DetailAttemptError, RetryExhausted, run_with_retries
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
@@ -31,6 +33,7 @@ class ItemOutcome:
     status: str
     elapsed_ms: int
     error: str | None = None
+    attempts: int = 1
 
 
 @dataclass
@@ -54,10 +57,12 @@ def run_source(
     limit: int | None = None,
     dry_run: bool = False,
     logger: logging.Logger | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> RunSummary:
     """采集一个源。
 
-    列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
+    列表页请求/解析失败会抛出异常并终止本轮；单条详情失败按源配置做指数退避
+    重试，重试耗尽写入 ``dead_letters``，只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
     """
 
@@ -90,6 +95,7 @@ def run_source(
                     raw_store=raw_store,
                     dry_run=dry_run,
                     logger=log,
+                    sleep=sleep,
                 )
                 summary.results.append(outcome)
                 if outcome.status == "ok":
@@ -121,16 +127,52 @@ def process_item(
     raw_store: RawStore,
     dry_run: bool,
     logger: logging.Logger,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> ItemOutcome:
-    """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。"""
+    """抓取并处理单条详情。
+
+    单次尝试的 FetchError / HTTP 4xx-5xx / ParseError 被统一包装成
+    :class:`DetailAttemptError` 交给重试层；所有尝试耗尽后走失败分支，
+    写 raw 留档与 dead_letters，不影响其他条目与 records 的幂等语义。
+    """
 
     source = adapter.source
     started = time.perf_counter()
     fetched_at = datetime.now(timezone.utc)
+    last_result: FetchResult | None = None
 
-    try:
-        result = adapter.fetch_detail(item.external_id)
-    except FetchError as exc:
+    def _one_attempt() -> tuple[FetchResult, Record]:
+        nonlocal last_result
+        try:
+            result = adapter.fetch_detail(item.external_id)
+        except FetchError as exc:
+            raise DetailAttemptError(str(exc)) from exc
+        last_result = result
+        if result.status_code >= 400:
+            raise DetailAttemptError(f"HTTP {result.status_code}")
+        try:
+            fields = adapter.parse_detail(result, item.external_id)
+            record = normalize_record(
+                source,
+                item.external_id,
+                fields,
+                detail_url=result.url,
+                fetched_at=fetched_at,
+            )
+        except ParseError as exc:
+            raise DetailAttemptError(exc.reason) from exc
+        return result, record
+
+    outcome_tuple, exhausted, attempts = run_with_retries(
+        _one_attempt,
+        source.retry,
+        logger=logger,
+        source=source.name,
+        external_id=item.external_id,
+        sleep=sleep,
+    )
+
+    if exhausted is not None:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return _fail(
             source.name,
@@ -139,49 +181,14 @@ def process_item(
             raw_store=raw_store,
             dry_run=dry_run,
             logger=logger,
-            error=str(exc),
+            error=exhausted.error,
+            attempts=exhausted.attempts,
             elapsed_ms=elapsed_ms,
             fetched_at=fetched_at,
+            result=last_result,
         )
 
-    if result.status_code >= 400:
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        return _fail(
-            source.name,
-            item,
-            db=db,
-            raw_store=raw_store,
-            dry_run=dry_run,
-            logger=logger,
-            error=f"HTTP {result.status_code}",
-            elapsed_ms=elapsed_ms,
-            fetched_at=fetched_at,
-            result=result,
-        )
-
-    try:
-        fields = adapter.parse_detail(result, item.external_id)
-        record = normalize_record(
-            source,
-            item.external_id,
-            fields,
-            detail_url=result.url,
-            fetched_at=fetched_at,
-        )
-    except ParseError as exc:
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        return _fail(
-            source.name,
-            item,
-            db=db,
-            raw_store=raw_store,
-            dry_run=dry_run,
-            logger=logger,
-            error=exc.reason,
-            elapsed_ms=elapsed_ms,
-            fetched_at=fetched_at,
-            result=result,
-        )
+    result, record = outcome_tuple
 
     if not dry_run:
         raw_path = raw_store.save(
@@ -203,10 +210,17 @@ def process_item(
             )
         )
         db.upsert_record(record)
+        # 之前进过死信、本次重跑成功的条目，从 dead_letters 移除。
+        db.delete_dead_letter(source.name, item.external_id)
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_item(logger, source.name, item.external_id, "ok", elapsed_ms)
-    return ItemOutcome(external_id=item.external_id, status="ok", elapsed_ms=elapsed_ms)
+    return ItemOutcome(
+        external_id=item.external_id,
+        status="ok",
+        elapsed_ms=elapsed_ms,
+        attempts=attempts,
+    )
 
 
 def _fail(
@@ -218,6 +232,7 @@ def _fail(
     dry_run: bool,
     logger: logging.Logger,
     error: str,
+    attempts: int,
     elapsed_ms: int,
     fetched_at: datetime,
     result: FetchResult | None = None,
@@ -243,11 +258,22 @@ def _fail(
                 raw_path=raw_path,
             )
         )
+        db.upsert_dead_letter(
+            DeadLetter(
+                source=source_name,
+                external_id=item.external_id,
+                url=result.url if result is not None else item.url,
+                error=summary,
+                attempts=attempts,
+                failed_at=fetched_at,
+            )
+        )
     log_item(logger, source_name, item.external_id, "failed", elapsed_ms)
     logger.warning(
-        "item failed source=%s external_id=%s error=%s",
+        "item failed source=%s external_id=%s attempts=%d error=%s",
         source_name,
         item.external_id,
+        attempts,
         summary,
     )
     return ItemOutcome(
@@ -255,6 +281,7 @@ def _fail(
         status="failed",
         elapsed_ms=elapsed_ms,
         error=summary,
+        attempts=attempts,
     )
 
 

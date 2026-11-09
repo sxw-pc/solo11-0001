@@ -1,5 +1,8 @@
 # crawl-flow 源配置
 # 每个源必须包含 name / type / base_url；page_size 只对 api 类型生效。
+# retry 为单条详情的指数退避重试策略（可省略，缺省即下面的默认值）：
+#   max_retries=3、base_delay_seconds=1、backoff_factor=2 → 重试间隔 1s/2s/4s；
+#   max_retries: 0 关闭重试，失败直接写入 dead_letters 表。
 sources:
   - name: demo_api
     type: api
@@ -10,6 +13,10 @@ sources:
     # 默认路径分别是 /api/items 与 /api/items/{id}，这里显式写出便于阅读
     list_path: /api/items
     detail_path: /api/items/{id}
+    retry:
+      max_retries: 3
+      base_delay_seconds: 1
+      backoff_factor: 2
     field_map:
       title: title
       category: category
@@ -26,6 +33,10 @@ sources:
     timeout_seconds: 10
     list_path: /list
     detail_path: /item/{id}
+    retry:
+      max_retries: 3
+      base_delay_seconds: 1
+      backoff_factor: 2
     field_map:
       title: title
       category: category
@@ -34,8 +45,10 @@ sources:
       content: content
       url: null
 
-  # 故障演练源：详情一律返回 500，用来验证错误隔离。
+  # 故障演练源：详情一律返回 500，用来验证错误隔离、指数退避重试与死信队列。
   # 默认 disabled，--all 不会带上；可显式 `--source demo_api_flaky` 运行。
+  # 3 次重试（1s/2s/4s）耗尽后，条目写入 dead_letters，可用
+  # `crawl-flow dead-letters list --source demo_api_flaky` 查看。
   - name: demo_api_flaky
     type: api
     base_url: http://127.0.0.1:8010
@@ -44,6 +57,10 @@ sources:
     timeout_seconds: 10
     list_path: /api/items
     detail_path: /api/items/{id}?fail=1
+    retry:
+      max_retries: 3
+      base_delay_seconds: 1
+      backoff_factor: 2
     field_map:
       title: title
       category: category

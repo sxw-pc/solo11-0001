@@ -31,6 +31,22 @@ class FieldMapping(BaseModel):
     url: str | None = None
 
 
+class RetryConfig(BaseModel):
+    """单条详情失败后的指数退避重试策略。
+
+    第 N 次重试（N 从 1 开始）前等待
+    ``base_delay_seconds * backoff_factor ** (N - 1)`` 秒；
+    默认 3 次重试，间隔 1s / 2s / 4s，即单条最多请求 4 次。
+    ``max_retries: 0`` 关闭重试，失败直接进入死信队列。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_retries: int = Field(default=3, ge=0, le=10)
+    base_delay_seconds: float = Field(default=1.0, gt=0, le=300)
+    backoff_factor: float = Field(default=2.0, ge=1.0, le=10.0)
+
+
 class SourceConfig(BaseModel):
     """单个源的配置。"""
 
@@ -45,6 +61,7 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
 
     @field_validator("base_url")
     @classmethod

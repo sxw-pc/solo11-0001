@@ -48,9 +48,15 @@ crawl-flow db stats
 
 ```bash
 crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库
-crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
+crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源（重试 3 次后进 dead_letters）
 crawl-flow db stats --db data/crawl.db
+crawl-flow dead-letters list --source demo_api_flaky  # 查看某源的死信
 ```
+
+单条详情失败默认按指数退避重试 3 次（间隔 1s/2s/4s），仍失败则写入
+`dead_letters` 表（字段 `source`、`external_id`、`url`、`error`、`attempts`、
+`failed_at`）；重试参数可在源配置的 `retry` 段调整，`retry.max_retries: 0`
+关闭重试。死信条目在后续重跑成功后自动移除，`records` 的幂等语义不变。
 
 ## 目录速览
 
@@ -72,7 +78,7 @@ crawl-flow/
 1. **增量游标 / 断点续采**：每次从列表第 1 页全量重扫，没有游标与断点。
 2. **并发抓取 / 全局限速 / 代理池**：单线程串行请求，无速率控制、无代理。
 3. **内容指纹去重**：只保证 `(source, external_id)` 唯一，不做正文指纹。
-4. **重试退避 / 死信队列 / 失败重放**：仅对连接级传输异常做一次立即重试，5xx 不重试，失败只留档不自动重放。
+4. **失败自动重放**：单条详情已支持可配置的指数退避重试（默认 3 次，1s/2s/4s）与 `dead_letters` 死信表，但不主动调度重放，死信只能靠下一次全量 `run` 重新处理。
 5. **清洗规则 DSL / 字段质量校验**：清洗逻辑固定在代码中，不做可配置 DSL 与质量评分。
 6. **任务编排 / 定时调度 / 指标暴露**：只能手动执行 CLI，无调度器与监控指标。
 7. **浏览器渲染（Playwright）**：只抓取静态 HTTP 响应，不执行 JavaScript。

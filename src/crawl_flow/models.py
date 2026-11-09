@@ -59,6 +59,19 @@ class RawRecord(BaseModel):
         return trimmed or None
 
 
+class DeadLetter(BaseModel):
+    """重试耗尽后进入死信队列的条目，对应 ``dead_letters`` 表。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(min_length=1)
+    external_id: str = Field(min_length=1)
+    url: str
+    error: str
+    attempts: int = Field(ge=1)
+    failed_at: datetime
+
+
 class Base(DeclarativeBase):
     """SQLAlchemy 声明式基类。"""
 
@@ -103,3 +116,25 @@ class RecordRow(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class DeadLetterRow(Base):
+    """``dead_letters``：重试耗尽仍失败的条目，(source, external_id) 唯一。
+
+    后续重跑若该条目成功，对应死信行会被删除；同一源同一 id 再次失败则
+    upsert 覆盖，始终只保留最新一次失败信息。
+    """
+
+    __tablename__ = "dead_letters"
+    __table_args__ = (
+        UniqueConstraint("source", "external_id", name="uq_dead_letters_source_external"),
+        Index("ix_dead_letters_source", "source"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    error: Mapped[str] = mapped_column(Text, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    failed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

@@ -27,6 +27,8 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="数据库运维命令", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+dead_letters_app = typer.Typer(help="死信队列：重试耗尽的详情条目", no_args_is_help=True)
+app.add_typer(dead_letters_app, name="dead-letters")
 
 
 @app.command("run")
@@ -114,6 +116,49 @@ def db_stats(
         f"{'TOTAL':<24}{totals['records']:>8}{totals['raw_ok']:>8}"
         f"{totals['raw_failed']:>12}"
     )
+
+
+@dead_letters_app.command("list")
+def dead_letters_list(
+    source: Optional[str] = typer.Option(
+        None, "--source", "-s", help="只查看指定源的死信；缺省列出全部"
+    ),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
+) -> None:
+    """列出重试耗尽后进入 dead_letters 的条目。"""
+
+    configure_logging(verbose)
+    if not db_path.exists():
+        typer.secho(f"数据库不存在: {db_path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    database = Database(db_path)
+    try:
+        database.init()
+        letters = database.list_dead_letters(source)
+    except StoreError as exc:
+        typer.secho(f"查询失败: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    finally:
+        database.close()
+
+    if not letters:
+        scope = f"source={source} " if source else ""
+        typer.echo(f"没有死信条目（{scope}db={db_path}）")
+        return
+
+    typer.echo(
+        f"{'source':<18}{'external_id':<14}{'attempts':>9}  "
+        f"{'failed_at':<28}error  url"
+    )
+    for letter in letters:
+        error = letter.error if len(letter.error) <= 60 else letter.error[:57] + "..."
+        typer.echo(
+            f"{letter.source:<18}{letter.external_id:<14}{letter.attempts:>9}  "
+            f"{letter.failed_at.isoformat(sep=' '):<28}{error}  {letter.url}"
+        )
+    typer.echo(f"共 {len(letters)} 条死信")
 
 
 @app.command("serve-mock")
