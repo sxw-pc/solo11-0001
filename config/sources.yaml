@@ -34,6 +34,26 @@ sources:
       content: content
       url: null
 
+  # JS 渲染源：详情正文由前端脚本注入，静态抓取只能拿到空壳。
+  # render: true 时详情页走渲染器（Playwright 为可选依赖，见 pyproject 的 render extra）；
+  # 默认 disabled，避免未安装 Playwright 的环境在 --all 时报缺依赖错误。
+  - name: demo_html_render
+    type: html
+    base_url: http://127.0.0.1:8010
+    enabled: false
+    render: true
+    page_size: 5
+    timeout_seconds: 30
+    list_path: /js-list
+    detail_path: /item/{id}
+    field_map:
+      title: title
+      category: category
+      tags: tags
+      published_at: published_at
+      content: content
+      url: null
+
   # 故障演练源：详情一律返回 500，用来验证错误隔离。
   # 默认 disabled，--all 不会带上；可显式 `--source demo_api_flaky` 运行。
   - name: demo_api_flaky

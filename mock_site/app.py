@@ -16,6 +16,7 @@ from flask import Flask, Response, jsonify, request
 DEFAULT_FIXTURES = Path(__file__).resolve().parent / "fixtures"
 HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 HTML_ID_PATTERN = re.compile(r"html-(\d+)")
+JS_ID_PATTERN = re.compile(r"js-(\d+)")
 EMPTY_LIST_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>公开数据列表（空）</title></head>
@@ -37,6 +38,8 @@ INDEX_HTML = """<!doctype html>
   <li><a href="/api/items/api-1">API 详情示例</a></li>
   <li><a href="/list?page=1">HTML 列表</a></li>
   <li><a href="/item/html-1">HTML 详情示例</a></li>
+  <li><a href="/js-list?page=1">JS 渲染列表</a></li>
+  <li><a href="/item/js-1">JS 渲染详情示例（正文由脚本注入）</a></li>
 </ul>
 </body>
 </html>
@@ -101,12 +104,33 @@ def create_app(fixtures_dir: str | Path | None = None) -> Flask:
     def html_detail(item_id: str) -> Response | tuple[str, int]:
         if _flag("fail"):
             return "<h1>模拟故障</h1>", 500
+        # js- 前缀的详情页正文由前端脚本注入，静态响应只是空壳。
+        js_match = JS_ID_PATTERN.fullmatch(item_id)
+        if js_match is not None:
+            path = fixtures / "html" / f"js_item_{js_match.group(1)}.html"
+            if not path.is_file():
+                return "not found", 404
+            return Response(path.read_text(encoding="utf-8"), content_type=HTML_CONTENT_TYPE)
         match = HTML_ID_PATTERN.fullmatch(item_id)
         if match is None:
             return "not found", 404
         path = fixtures / "html" / f"item_{match.group(1)}.html"
         if not path.is_file():
             return "not found", 404
+        return Response(path.read_text(encoding="utf-8"), content_type=HTML_CONTENT_TYPE)
+
+    @app.get("/js-list")
+    def js_html_list() -> Response | tuple[str, int]:
+        """JS 渲染源的列表页：结构与 /list 一致，详情链接使用 js- 前缀 id。"""
+
+        if _flag("fail"):
+            return "simulated list failure", 503
+        if _flag("empty"):
+            return Response(EMPTY_LIST_HTML, content_type=HTML_CONTENT_TYPE)
+        page = _positive_int("page", 1)
+        path = fixtures / "html" / f"js_list_{page}.html"
+        if not path.is_file():
+            return Response(EMPTY_LIST_HTML, content_type=HTML_CONTENT_TYPE)
         return Response(path.read_text(encoding="utf-8"), content_type=HTML_CONTENT_TYPE)
 
     return app

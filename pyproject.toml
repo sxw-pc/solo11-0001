@@ -26,6 +26,9 @@ dependencies = [
 dev = [
     "pytest==8.3.3",
 ]
+render = [
+    "playwright==1.47.0",
+]
 
 [project.scripts]
 crawl-flow = "crawl_flow.cli:app"

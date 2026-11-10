@@ -8,9 +8,10 @@ from typing import Any, Iterator
 from urllib.parse import quote
 
 from crawl_flow.config import SourceConfig
-from crawl_flow.errors import FetchError, ParseError
+from crawl_flow.errors import FetchError, ParseError, RendererError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
+from crawl_flow.render.base import Renderer
 
 MAX_PAGES = 500
 
@@ -40,9 +41,15 @@ class ListPage:
 class SourceAdapter(ABC):
     """源适配器接口：列表翻页、列表解析、详情解析、详情 URL。"""
 
-    def __init__(self, source: SourceConfig, fetcher: Fetcher) -> None:
+    def __init__(
+        self,
+        source: SourceConfig,
+        fetcher: Fetcher,
+        renderer: Renderer | None = None,
+    ) -> None:
         self.source = source
         self.fetcher = fetcher
+        self.renderer = renderer
 
     # ---- 子类必须实现 ----
     @abstractmethod
@@ -68,9 +75,21 @@ class SourceAdapter(ABC):
         return {"page": page}
 
     def fetch_detail(self, external_id: str) -> FetchResult:
-        """请求详情页；HTTP 状态码交由管道判断，不在此处抛错。"""
+        """请求详情页；HTTP 状态码交由管道判断，不在此处抛错。
 
-        return self.fetcher.get(self.detail_url(external_id))
+        ``source.render=True`` 时改走渲染器（执行页面 JS 后取最终 DOM），
+        渲染失败抛 :class:`~crawl_flow.errors.RendererError`；否则用静态
+        HTTP 客户端。列表页始终走静态抓取，不受该开关影响。
+        """
+
+        url = self.detail_url(external_id)
+        if self.source.render:
+            if self.renderer is None:
+                raise RendererError(
+                    f"源 {self.source.name} 开启了 render，但未配置渲染器"
+                )
+            return self.renderer.render(url)
+        return self.fetcher.get(url)
 
     def iter_list_pages(self) -> Iterator[ListPage]:
         """从第 1 页开始翻页，遇到空页终止。

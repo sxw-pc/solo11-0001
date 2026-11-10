@@ -36,6 +36,26 @@ crawl-flow db stats
 
 同一源重复执行不会增加 `records` 行数，只会刷新 `updated_at`。
 
+## JS 渲染源（可选能力）
+
+详情正文由前端 JavaScript 注入的站点，静态 HTTP 抓取只能拿到空壳。在源配置里
+加 `render: true`，详情页就会改走可插拔渲染器执行页面脚本后再解析；列表页仍走
+静态抓取，行为不变。
+
+渲染器是 `crawl_flow.render` 下的独立组件，管道与适配器只依赖统一的 `Renderer`
+接口；默认后端 Playwright 是**可选依赖**，未安装时不影响普通源，只有运行
+`render: true` 的源才会报带安装指引的清晰错误并以退出码 2 结束：
+
+```bash
+pip install 'crawl-flow[render]'
+python -m playwright install chromium
+crawl-flow run --source demo_html_render
+```
+
+未安装渲染依赖时，任何 `render: true` 的源都不会被静默降级为静态抓取。
+仓库自带的 `demo_html_render` 源默认 `enabled: false`，其详情页
+（`/item/js-1`、`/item/js-2`）正文完全由内联脚本注入，可用于手动验收。
+
 ## 三条核心命令
 
 | 用途 | 命令 |
@@ -75,4 +95,5 @@ crawl-flow/
 4. **重试退避 / 死信队列 / 失败重放**：仅对连接级传输异常做一次立即重试，5xx 不重试，失败只留档不自动重放。
 5. **清洗规则 DSL / 字段质量校验**：清洗逻辑固定在代码中，不做可配置 DSL 与质量评分。
 6. **任务编排 / 定时调度 / 指标暴露**：只能手动执行 CLI，无调度器与监控指标。
-7. **浏览器渲染（Playwright）**：只抓取静态 HTTP 响应，不执行 JavaScript。
+7. **渲染范围限制**：渲染能力只覆盖详情页（列表页始终静态抓取）；目前仅提供
+   Playwright 一个后端，不做请求拦截、资源屏蔽、多浏览器指纹与分布式渲染。

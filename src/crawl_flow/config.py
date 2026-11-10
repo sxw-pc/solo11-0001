@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator, model_validator
 
 from crawl_flow.errors import ConfigError
 
@@ -40,6 +40,8 @@ class SourceConfig(BaseModel):
     type: SourceType
     base_url: str
     enabled: bool = True
+    # StrictBool：YAML 里写成 "true" 等字符串必须校验失败，而不是被悄悄强转。
+    render: StrictBool = False
     page_size: int = Field(default=5, ge=1, le=100)
     timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     list_path: str | None = None

@@ -35,5 +35,13 @@ class ParseError(CrawlFlowError):
         self.reason = reason
 
 
+class RendererError(CrawlFlowError):
+    """页面渲染失败：浏览器导航、超时或渲染器内部错误。"""
+
+
+class RendererDependencyError(RendererError):
+    """渲染能力的可选依赖（Playwright / 浏览器内核）未安装。"""
+
+
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""

@@ -9,12 +9,18 @@ from datetime import datetime, timezone
 from typing import Any
 
 from crawl_flow.config import SourceConfig
-from crawl_flow.errors import FetchError, ParseError
+from crawl_flow.errors import (
+    FetchError,
+    ParseError,
+    RendererDependencyError,
+    RendererError,
+)
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
 from crawl_flow.models import RawRecord
 from crawl_flow.observability.logging import log_item
 from crawl_flow.pipeline.normalize import normalize_record
+from crawl_flow.render.base import Renderer
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
@@ -51,6 +57,7 @@ def run_source(
     raw_store: RawStore,
     *,
     fetcher: Fetcher | None = None,
+    renderer: Renderer | None = None,
     limit: int | None = None,
     dry_run: bool = False,
     logger: logging.Logger | None = None,
@@ -59,18 +66,29 @@ def run_source(
 
     列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
+
+    ``source.render=True`` 时详情页走渲染器：可通过 ``renderer`` 注入替身；
+    未注入时按注册表创建默认渲染器（Playwright 为可选依赖，缺失时抛
+    :class:`~crawl_flow.errors.RendererDependencyError`，由 CLI 转退出码 2）。
     """
 
     log = logger or logging.getLogger(LOGGER_NAME)
     owns_fetcher = fetcher is None
     active_fetcher = fetcher or Fetcher(timeout=source.timeout_seconds)
-    adapter = create_adapter(source, active_fetcher)
-    summary = RunSummary(source=source.name)
-    started = time.perf_counter()
-    seen: set[str] = set()
-    processed = 0
-
+    active_renderer = renderer
+    owns_renderer = False
     try:
+        if source.render and active_renderer is None:
+            from crawl_flow.render.factory import create_renderer
+
+            active_renderer = create_renderer(timeout=source.timeout_seconds)
+            owns_renderer = True
+        adapter = create_adapter(source, active_fetcher, active_renderer)
+        summary = RunSummary(source=source.name)
+        started = time.perf_counter()
+        seen: set[str] = set()
+        processed = 0
+
         for page in adapter.iter_list_pages():
             for item in page.items:
                 if item.external_id in seen:
@@ -97,6 +115,8 @@ def run_source(
                 else:
                     summary.failed += 1
     finally:
+        if owns_renderer and active_renderer is not None:
+            active_renderer.close()
         if owns_fetcher:
             active_fetcher.close()
 
@@ -130,7 +150,10 @@ def process_item(
 
     try:
         result = adapter.fetch_detail(item.external_id)
-    except FetchError as exc:
+    except RendererDependencyError:
+        # 可选依赖缺失属于环境问题，不降级为单条失败，直接交给 CLI 退出码 2。
+        raise
+    except (FetchError, RendererError) as exc:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return _fail(
             source.name,

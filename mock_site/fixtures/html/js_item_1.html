@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>JS 渲染详情（一）</title></head>
+<body>
+  <article class="item">
+    <h1 class="title">JS 渲染详情（一）</h1>
+    <p class="meta">
+      <span class="category">技术</span>
+      <span class="date">2024-03-10</span>
+      <span class="tags">渲染、JavaScript、Playwright</span>
+    </p>
+    <!-- 静态响应里正文为空壳，正文完全由下面的内联脚本注入 -->
+    <div class="content" id="js-content"></div>
+    <p><a class="back" href="/js-list?page=1">返回列表</a></p>
+  </article>
+  <script>
+    (function () {
+      var injected = [
+        "<p>本页正文由 JavaScript 在浏览器端注入，静态 HTTP 抓取只能拿到空壳。</p>",
+        "<p>渲染器执行页面脚本后，div.content 才会出现这段文字。</p>",
+      ].join("");
+      document.getElementById("js-content").innerHTML = injected;
+    })();
+  </script>
+</body>
+</html>

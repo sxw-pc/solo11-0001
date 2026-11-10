@@ -9,7 +9,13 @@ from typing import Optional
 import typer
 
 from crawl_flow.config import load_sources, select_sources
-from crawl_flow.errors import ConfigError, FetchError, StoreError
+from crawl_flow.errors import (
+    ConfigError,
+    FetchError,
+    RendererDependencyError,
+    RendererError,
+    StoreError,
+)
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
 from crawl_flow.pipeline.run import RunSummary, run_source
@@ -70,6 +76,12 @@ def run_command(
                 )
     except FetchError as exc:
         typer.secho(f"采集失败（整轮中止）: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    except RendererDependencyError as exc:
+        typer.secho(f"渲染依赖缺失: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    except RendererError as exc:
+        typer.secho(f"渲染失败（整轮中止）: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
     except StoreError as exc:
         typer.secho(f"存储失败: {exc}", fg=typer.colors.RED, err=True)
