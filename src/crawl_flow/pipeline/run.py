@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from crawl_flow.config import SourceConfig
+from crawl_flow.cursor.manager import CursorManager
+from crawl_flow.cursor.store import CursorStore
 from crawl_flow.errors import FetchError, ParseError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
@@ -41,6 +43,7 @@ class RunSummary:
     ok: int = 0
     failed: int = 0
     skipped: int = 0
+    cursor_skipped: int = 0
     elapsed_ms: int = 0
     results: list[ItemOutcome] = field(default_factory=list)
 
@@ -53,12 +56,17 @@ def run_source(
     fetcher: Fetcher | None = None,
     limit: int | None = None,
     dry_run: bool = False,
+    cursor_store: CursorStore | None = None,
     logger: logging.Logger | None = None,
 ) -> RunSummary:
     """采集一个源。
 
     列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
+
+    当源配置了 ``cursor`` 且传入 ``cursor_store`` 时启用断点续采：已完成条目
+    在发起详情请求前被跳过（计入 ``cursor_skipped``），每条全流程处理完成后
+    再原子推进游标；游标异常由管理器内部降级为全量采集，不影响错误隔离逻辑。
     """
 
     log = logger or logging.getLogger(LOGGER_NAME)
@@ -68,7 +76,13 @@ def run_source(
     summary = RunSummary(source=source.name)
     started = time.perf_counter()
     seen: set[str] = set()
+    # processed 只统计真正发起详情处理的条目（游标跳过不计），保证 --limit 语义不变。
     processed = 0
+    position = 0
+
+    cursor = _build_cursor(source, cursor_store, dry_run=dry_run, logger=log)
+    if cursor is not None:
+        cursor.start()
 
     try:
         for page in adapter.iter_list_pages():
@@ -78,6 +92,20 @@ def run_source(
                     log_item(log, source.name, item.external_id, "skipped", 0)
                     continue
                 seen.add(item.external_id)
+                current_position = position
+                position += 1
+                if cursor is not None and cursor.should_skip(
+                    item.external_id, current_position
+                ):
+                    summary.cursor_skipped += 1
+                    log_item(
+                        log,
+                        source.name,
+                        item.external_id,
+                        "cursor_skipped",
+                        0,
+                    )
+                    continue
                 if limit is not None and processed >= limit:
                     summary.skipped += 1
                     log_item(log, source.name, item.external_id, "skipped", 0)
@@ -96,21 +124,47 @@ def run_source(
                     summary.ok += 1
                 else:
                     summary.failed += 1
+                # 游标在条目全流程处理完成（成功或隔离失败均算走完）后再写入，
+                # 避免「游标已推进、数据未落库」导致的丢数据。
+                if cursor is not None:
+                    cursor.mark_processed(item.external_id, current_position)
     finally:
         if owns_fetcher:
             active_fetcher.close()
 
     summary.elapsed_ms = int((time.perf_counter() - started) * 1000)
     log.info(
-        "run summary source=%s ok=%d failed=%d skipped=%d elapsed_ms=%d dry_run=%s",
+        "run summary source=%s ok=%d failed=%d skipped=%d cursor_skipped=%d "
+        "elapsed_ms=%d dry_run=%s",
         summary.source,
         summary.ok,
         summary.failed,
         summary.skipped,
+        summary.cursor_skipped,
         summary.elapsed_ms,
         str(dry_run).lower(),
     )
     return summary
+
+
+def _build_cursor(
+    source: SourceConfig,
+    cursor_store: CursorStore | None,
+    *,
+    dry_run: bool,
+    logger: logging.Logger,
+) -> CursorManager | None:
+    """按配置构造源级游标管理器；未启用或未提供存储时返回 None（全量模式）。"""
+
+    if source.cursor is None or not source.cursor.enabled or cursor_store is None:
+        return None
+    return CursorManager(
+        source_name=source.name,
+        rule_name=source.cursor.rule,
+        store=cursor_store,
+        logger=logger,
+        dry_run=dry_run,
+    )
 
 
 def process_item(

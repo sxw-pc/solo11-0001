@@ -10,6 +10,11 @@ sources:
     # 默认路径分别是 /api/items 与 /api/items/{id}，这里显式写出便于阅读
     list_path: /api/items
     detail_path: /api/items/{id}
+    # 增量断点：启用后按 external_id 记录游标，中断重启自动续采；
+    # `crawl-flow cursor reset --source demo_api` 可清空游标回到全量。
+    cursor:
+      enabled: true
+      rule: completed_ids
     field_map:
       title: title
       category: category
@@ -26,6 +31,10 @@ sources:
     timeout_seconds: 10
     list_path: /list
     detail_path: /item/{id}
+    # HTML 源列表顺序稳定，这里演示按列表位置记录断点的另一种规则。
+    cursor:
+      enabled: true
+      rule: list_position
     field_map:
       title: title
       category: category

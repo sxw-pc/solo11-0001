@@ -37,3 +37,7 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class CursorError(CrawlFlowError):
+    """游标读取、解析或写入失败；由游标管理器内部降级，不中断采集。"""

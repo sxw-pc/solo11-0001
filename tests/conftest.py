@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from mock_site.app import create_app  # noqa: E402
 
 from crawl_flow.config import SourceConfig  # noqa: E402
+from crawl_flow.cursor.store import CursorStore  # noqa: E402
 from crawl_flow.fetch.client import Fetcher  # noqa: E402
 from crawl_flow.storage.db import Database  # noqa: E402
 from crawl_flow.storage.raw_store import RawStore  # noqa: E402
@@ -92,6 +93,11 @@ def db(tmp_path: Path) -> Iterator[Database]:
 @pytest.fixture
 def raw_store(tmp_path: Path) -> RawStore:
     return RawStore(tmp_path / "raw")
+
+
+@pytest.fixture
+def cursor_store(tmp_path: Path) -> CursorStore:
+    return CursorStore(tmp_path / "cursors")
 
 
 @pytest.fixture

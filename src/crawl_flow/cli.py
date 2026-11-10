@@ -9,7 +9,9 @@ from typing import Optional
 import typer
 
 from crawl_flow.config import load_sources, select_sources
-from crawl_flow.errors import ConfigError, FetchError, StoreError
+from crawl_flow.cursor.manager import CursorManager
+from crawl_flow.cursor.store import CursorStore
+from crawl_flow.errors import ConfigError, CursorError, FetchError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
 from crawl_flow.pipeline.run import RunSummary, run_source
@@ -19,6 +21,7 @@ from crawl_flow.storage.raw_store import RawStore
 DEFAULT_CONFIG = Path("config/sources.yaml")
 DEFAULT_DB = Path("data/crawl.db")
 DEFAULT_RAW_DIR = Path("data/raw")
+DEFAULT_CURSOR_DIR = Path("data/cursors")
 
 app = typer.Typer(
     add_completion=False,
@@ -27,6 +30,8 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="数据库运维命令", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+cursor_app = typer.Typer(help="增量游标（断点续采）运维命令", no_args_is_help=True)
+app.add_typer(cursor_app, name="cursor")
 
 
 @app.command("run")
@@ -34,13 +39,16 @@ def run_command(
     source: Optional[str] = typer.Option(None, "--source", "-s", help="只采集指定源"),
     all_sources: bool = typer.Option(False, "--all", help="采集所有 enabled 源"),
     limit: Optional[int] = typer.Option(None, "--limit", min=1, help="每个源最多处理 N 条"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="只解析，不写 raw 与数据库"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只解析，不写 raw、数据库与游标"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
     config: Path = typer.Option(DEFAULT_CONFIG, "--config", help="源配置文件路径"),
     db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
     raw_dir: Path = typer.Option(DEFAULT_RAW_DIR, "--raw-dir", help="原始响应目录"),
+    cursor_dir: Path = typer.Option(
+        DEFAULT_CURSOR_DIR, "--cursor-dir", help="增量游标文件目录"
+    ),
 ) -> None:
-    """跑一轮采集。"""
+    """跑一轮采集（配置了 cursor 的源自动启用断点续采）。"""
 
     logger = configure_logging(verbose)
     try:
@@ -52,6 +60,7 @@ def run_command(
 
     db = Database(db_path)
     raw_store = RawStore(raw_dir)
+    cursor_store = CursorStore(cursor_dir)
     summaries: list[RunSummary] = []
     try:
         db.init()
@@ -65,6 +74,7 @@ def run_command(
                         fetcher=fetcher,
                         limit=limit,
                         dry_run=dry_run,
+                        cursor_store=cursor_store,
                         logger=logger,
                     )
                 )
@@ -116,6 +126,100 @@ def db_stats(
     )
 
 
+@cursor_app.command("list")
+def cursor_list(
+    cursor_dir: Path = typer.Option(
+        DEFAULT_CURSOR_DIR, "--cursor-dir", help="增量游标文件目录"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
+) -> None:
+    """列出各源当前持久化的游标状态。"""
+
+    configure_logging(verbose)
+    store = CursorStore(cursor_dir)
+    names = store.list_sources()
+    if not names:
+        typer.echo(f"游标目录 {cursor_dir} 下没有游标文件")
+        return
+
+    typer.echo(f"{'source':<24}{'rule':<16}{'completed':>10}  cursor_file")
+    for name in names:
+        try:
+            payload = store.load(name)
+        except CursorError as exc:
+            typer.secho(
+                f"{name:<24}{'CORRUPTED':<16}{'-':>10}  {exc}",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            continue
+        rule = (payload or {}).get("rule", "-")
+        state = (payload or {}).get("state", {}) or {}
+        completed = _cursor_completed_count(rule, state)
+        typer.echo(
+            f"{name:<24}{str(rule):<16}{completed:>10}  {store.path_for(name)}"
+        )
+
+
+@cursor_app.command("reset")
+def cursor_reset(
+    source: Optional[str] = typer.Option(
+        None, "--source", "-s", help="只重置指定源的游标"
+    ),
+    all_sources: bool = typer.Option(False, "--all", help="重置配置中所有源的游标"),
+    config: Path = typer.Option(DEFAULT_CONFIG, "--config", help="源配置文件路径"),
+    cursor_dir: Path = typer.Option(
+        DEFAULT_CURSOR_DIR, "--cursor-dir", help="增量游标文件目录"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
+) -> None:
+    """手动清空游标，使下次运行回到全量采集模式。"""
+
+    logger = configure_logging(verbose)
+    store = CursorStore(cursor_dir)
+
+    if all_sources and source:
+        typer.secho("--source 与 --all 不能同时使用", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    # 显式 --source / --all 走配置校验，避免重置一个拼写错误的源名；
+    # 两者都不给时，直接清空游标目录下的全部游标文件。
+    if source or all_sources:
+        try:
+            configured = load_sources(config)
+            targets = [
+                item.name
+                for item in select_sources(configured, name=source, all_sources=all_sources)
+            ]
+        except ConfigError as exc:
+            typer.secho(f"配置错误: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+    else:
+        targets = store.list_sources()
+
+    if not targets:
+        typer.echo("没有可重置的游标")
+        return
+
+    for name in targets:
+        manager = CursorManager(
+            source_name=name, rule_name="completed_ids", store=store, logger=logger
+        )
+        try:
+            removed = manager.reset()
+        except CursorError as exc:
+            typer.secho(
+                f"游标重置失败 source={name}: {exc}", fg=typer.colors.RED, err=True
+            )
+            raise typer.Exit(code=2) from exc
+        if removed:
+            typer.secho(
+                f"已重置游标 source={name}，下次运行回到全量采集", fg=typer.colors.GREEN
+            )
+        else:
+            typer.echo(f"source={name} 没有游标文件，跳过")
+
+
 @app.command("serve-mock")
 def serve_mock(
     port: int = typer.Option(8010, "--port", min=1, max=65535, help="监听端口"),
@@ -140,19 +244,33 @@ def serve_mock(
     create_app().run(host=host, port=port, debug=False, use_reloader=False)
 
 
+def _cursor_completed_count(rule: str, state: dict[str, object]) -> str:
+    """从游标 state 中提取已完成数量，用于 ``cursor list`` 展示。"""
+
+    if rule == "completed_ids":
+        ids = state.get("completed_ids")
+        return str(len(ids)) if isinstance(ids, list) else "-"
+    if rule == "list_position":
+        count = state.get("completed_count")
+        return str(count) if isinstance(count, int) and not isinstance(count, bool) else "-"
+    return "-"
+
+
 def _print_summaries(summaries: list[RunSummary], *, dry_run: bool) -> None:
-    mode = "（dry-run，未写 raw 与数据库）" if dry_run else ""
+    mode = "（dry-run，未写 raw、数据库与游标）" if dry_run else ""
     typer.echo(f"本轮汇总{mode}")
     for summary in summaries:
         typer.echo(
             f"source={summary.source} ok={summary.ok} failed={summary.failed} "
-            f"skipped={summary.skipped} elapsed_ms={summary.elapsed_ms}"
+            f"skipped={summary.skipped} cursor_skipped={summary.cursor_skipped} "
+            f"elapsed_ms={summary.elapsed_ms}"
         )
     if summaries:
         typer.echo(
             f"total ok={sum(s.ok for s in summaries)} "
             f"failed={sum(s.failed for s in summaries)} "
-            f"skipped={sum(s.skipped for s in summaries)}"
+            f"skipped={sum(s.skipped for s in summaries)} "
+            f"cursor_skipped={sum(s.cursor_skipped for s in summaries)}"
         )
 
 

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from crawl_flow.errors import ConfigError
 
 SourceType = Literal["api", "html"]
+CursorRuleType = Literal["completed_ids", "list_position"]
 
 DEFAULT_PATHS: dict[str, tuple[str, str]] = {
     "api": ("/api/items", "/api/items/{id}"),
@@ -31,6 +32,20 @@ class FieldMapping(BaseModel):
     url: str | None = None
 
 
+class CursorConfig(BaseModel):
+    """单源增量断点（游标）配置。
+
+    - ``enabled``：是否为该源启用断点续采；默认 ``true``（配置了该段即启用）。
+    - ``rule``：游标规则，``completed_ids`` 按条目 ID 记录（默认，列表增删安全），
+      ``list_position`` 按列表枚举位置记录（要求列表顺序稳定）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    rule: CursorRuleType = "completed_ids"
+
+
 class SourceConfig(BaseModel):
     """单个源的配置。"""
 
@@ -45,6 +60,7 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    cursor: CursorConfig | None = None
 
     @field_validator("base_url")
     @classmethod
