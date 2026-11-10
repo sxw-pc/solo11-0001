@@ -74,10 +74,8 @@ class PlaywrightRenderer(Renderer):
         from playwright.sync_api import Error as PlaywrightError
 
         started = time.perf_counter()
-        context = self._browser.new_context(
-            user_agent=self._user_agent,
-            timeout=self._timeout_ms,
-        )
+        context = self._browser.new_context(user_agent=self._user_agent)
+        context.set_default_timeout(self._timeout_ms)
         page = context.new_page()
         try:
             try:

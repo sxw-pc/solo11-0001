@@ -325,7 +325,11 @@ def test_cli_missing_render_dependency_exits_2(
     write_config: Any,
     source_payload: Any,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "crawl_flow.render.playwright_renderer.playwright_available", lambda: False
+    )
     config_path = write_config(
         [
             source_payload(
