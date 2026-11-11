@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import httpx
 
@@ -37,17 +38,38 @@ class Fetcher:
     def get(self, url: str, params: dict[str, object] | None = None) -> FetchResult:
         """发起 GET，传输层失败抛 :class:`FetchError`，HTTP 错误码正常返回。"""
 
+        return self._request("GET", url, params=params)
+
+    def post(self, url: str, json: dict[str, Any] | None = None) -> FetchResult:
+        """发起 JSON POST，传输层失败抛 :class:`FetchError`，HTTP 错误码正常返回。
+
+        供采集管道之外的复用方（如通知推送）使用，重试语义与 :meth:`get` 一致。
+        """
+
+        return self._request("POST", url, json=json)
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, object] | None = None,
+        json: dict[str, Any] | None = None,
+    ) -> FetchResult:
         last_error: Exception | None = None
         for attempt in range(self._retries + 1):
             started = time.perf_counter()
             try:
-                response = self._client.get(url, params=params)
+                response = self._client.request(
+                    method, url, params=params, json=json
+                )
             except httpx.HTTPError as exc:
                 last_error = exc
                 if attempt < self._retries:
                     continue
                 raise FetchError(
-                    f"请求失败 url={url} error={exc.__class__.__name__}: {exc}",
+                    f"请求失败 method={method} url={url} "
+                    f"error={exc.__class__.__name__}: {exc}",
                     url=url,
                 ) from exc
             elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -58,7 +80,9 @@ class Fetcher:
                 body=response.text,
                 elapsed_ms=elapsed_ms,
             )
-        raise FetchError(f"请求失败 url={url} error={last_error}", url=url)
+        raise FetchError(
+            f"请求失败 method={method} url={url} error={last_error}", url=url
+        )
 
     def close(self) -> None:
         self._client.close()

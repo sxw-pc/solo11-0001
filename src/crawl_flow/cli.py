@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
 
 import typer
 
-from crawl_flow.config import load_sources, select_sources
+from crawl_flow.config import (
+    LoadedConfig,
+    SourceConfig,
+    load_config,
+    select_sources,
+)
 from crawl_flow.errors import ConfigError, FetchError, StoreError
 from crawl_flow.fetch.client import Fetcher
+from crawl_flow.notify.notifier import Notifier
 from crawl_flow.observability.logging import configure_logging
 from crawl_flow.pipeline.run import RunSummary, run_source
 from crawl_flow.storage.db import Database
@@ -35,6 +42,11 @@ def run_command(
     all_sources: bool = typer.Option(False, "--all", help="采集所有 enabled 源"),
     limit: Optional[int] = typer.Option(None, "--limit", min=1, help="每个源最多处理 N 条"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只解析，不写 raw 与数据库"),
+    no_notify: bool = typer.Option(
+        False,
+        "--no-notify",
+        help="临时禁用采集完成后的 webhook 通知（不影响配置文件）",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
     config: Path = typer.Option(DEFAULT_CONFIG, "--config", help="源配置文件路径"),
     db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
@@ -44,8 +56,8 @@ def run_command(
 
     logger = configure_logging(verbose)
     try:
-        sources = load_sources(config)
-        selected = select_sources(sources, name=source, all_sources=all_sources)
+        loaded: LoadedConfig = load_config(config)
+        selected = select_sources(loaded.sources, name=source, all_sources=all_sources)
     except ConfigError as exc:
         typer.secho(f"配置错误: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -78,6 +90,39 @@ def run_command(
         db.close()
 
     _print_summaries(summaries, dry_run=dry_run)
+    _send_notification(
+        loaded,
+        selected,
+        summaries,
+        dry_run=dry_run,
+        no_notify=no_notify,
+        logger=logger,
+    )
+
+
+def _send_notification(
+    loaded: LoadedConfig,
+    selected: list[SourceConfig],
+    summaries: list[RunSummary],
+    *,
+    dry_run: bool,
+    no_notify: bool,
+    logger: logging.Logger,
+) -> None:
+    """采集结束后推送 webhook 通知。
+
+    未配置任何地址、``--dry-run`` 或 ``--no-notify`` 时不产生任何 HTTP 请求，
+    行为与未启用通知前完全一致；推送中的所有失败只打 WARNING，不影响退出码。
+    """
+
+    has_global = bool(loaded.notify.webhooks)
+    has_override = any(source.notify is not None for source in selected)
+    if not (has_global or has_override):
+        return
+    with Notifier(loaded.notify, logger=logger) as notifier:
+        notifier.notify_round(
+            summaries, selected, dry_run=dry_run, disabled=no_notify
+        )
 
 
 @db_app.command("stats")

@@ -1,5 +1,18 @@
 # crawl-flow 源配置
 # 每个源必须包含 name / type / base_url；page_size 只对 api 类型生效。
+#
+# 可选的顶层 notify 段：每轮采集结束后把汇总 JSON POST 到 IM 机器人 webhook。
+# 不配置（或保持注释）时不会发出任何额外请求，行为与旧版本一致。
+# 地址里带密钥是允许的，但日志只会输出脱敏后的 scheme://host/***。
+#
+# notify:
+#   webhooks:
+#     - https://im.example.com/hooks/xxxxxxxx
+#     - https://backup.example.com/hooks/yyyyyyyy  # 多个地址逐个推送，互不影响
+#   timeout_seconds: 5            # 单次推送超时
+#   retries: 2                    # 失败重试次数（传输异常/超时/5xx 才重试，4xx 不重试）
+#   retry_backoff_seconds: 0.5    # 重试间隔
+#   alert_failure_rate: 0.1       # 失败率严格大于该阈值时消息 level=alert
 sources:
   - name: demo_api
     type: api
@@ -36,6 +49,10 @@ sources:
 
   # 故障演练源：详情一律返回 500，用来验证错误隔离。
   # 默认 disabled，--all 不会带上；可显式 `--source demo_api_flaky` 运行。
+  # 单源 notify 覆盖：该源的汇总只推送到这里的地址，不再走全局 webhook。
+  # notify:
+  #   webhooks:
+  #     - https://im.example.com/hooks/oncall-secret
   - name: demo_api_flaky
     type: api
     base_url: http://127.0.0.1:8010

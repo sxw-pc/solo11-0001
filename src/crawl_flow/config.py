@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -17,6 +19,11 @@ DEFAULT_PATHS: dict[str, tuple[str, str]] = {
     "html": ("/list", "/item/{id}"),
 }
 
+DEFAULT_NOTIFY_TIMEOUT_SECONDS = 5.0
+DEFAULT_NOTIFY_RETRIES = 2
+DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS = 0.5
+DEFAULT_ALERT_FAILURE_RATE = 0.1
+
 
 class FieldMapping(BaseModel):
     """源字段 → 标准字段的映射。值写源数据里的键名。"""
@@ -29,6 +36,54 @@ class FieldMapping(BaseModel):
     published_at: str = "published_at"
     content: str = "content"
     url: str | None = None
+
+
+def _validate_webhook(value: str) -> str:
+    """webhook 地址必须是 http(s) URL；密钥只允许出现在 URL 里（日志另行脱敏）。"""
+
+    if not value or not value.strip():
+        raise ValueError("webhook 地址不能为空")
+    candidate = value.strip()
+    parts = urlsplit(candidate)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("webhook 必须是合法的 http(s) URL")
+    return candidate
+
+
+class SourceNotifyConfig(BaseModel):
+    """单源通知覆盖：配置后该源只向这里的 webhook 推送，不再走全局地址。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    webhooks: list[str] = Field(min_length=1)
+
+    @field_validator("webhooks")
+    @classmethod
+    def _check_webhooks(cls, value: list[str]) -> list[str]:
+        return [_validate_webhook(item) for item in value]
+
+
+class NotifySettings(BaseModel):
+    """采集完成后的 IM webhook 通知配置（顶层 ``notify`` 段）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    webhooks: list[str] = Field(default_factory=list)
+    timeout_seconds: float = Field(
+        default=DEFAULT_NOTIFY_TIMEOUT_SECONDS, gt=0, le=120
+    )
+    retries: int = Field(default=DEFAULT_NOTIFY_RETRIES, ge=0, le=10)
+    retry_backoff_seconds: float = Field(
+        default=DEFAULT_NOTIFY_RETRY_BACKOFF_SECONDS, ge=0, le=60
+    )
+    alert_failure_rate: float = Field(
+        default=DEFAULT_ALERT_FAILURE_RATE, ge=0.0, le=1.0
+    )
+
+    @field_validator("webhooks")
+    @classmethod
+    def _check_webhooks(cls, value: list[str]) -> list[str]:
+        return [_validate_webhook(item) for item in value]
 
 
 class SourceConfig(BaseModel):
@@ -45,6 +100,7 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    notify: SourceNotifyConfig | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -65,8 +121,16 @@ class SourceConfig(BaseModel):
         return self
 
 
-def load_sources(path: str | Path) -> list[SourceConfig]:
-    """读取并校验源配置，任何问题统一抛 :class:`ConfigError`。"""
+@dataclass(frozen=True)
+class LoadedConfig:
+    """一次配置加载的结果：源列表 + 通知设置。"""
+
+    sources: list[SourceConfig]
+    notify: NotifySettings
+
+
+def load_config(path: str | Path) -> LoadedConfig:
+    """读取并校验源配置与通知配置，任何问题统一抛 :class:`ConfigError`。"""
 
     config_path = Path(path)
     if not config_path.is_file():
@@ -95,7 +159,25 @@ def load_sources(path: str | Path) -> list[SourceConfig]:
     duplicates = sorted({name for name in names if names.count(name) > 1})
     if duplicates:
         raise ConfigError(f"源名称重复: {', '.join(duplicates)}")
-    return sources
+
+    raw_notify = payload.get("notify")
+    if raw_notify is None:
+        notify = NotifySettings()
+    elif isinstance(raw_notify, dict):
+        try:
+            notify = NotifySettings.model_validate(raw_notify)
+        except ValidationError as exc:
+            raise ConfigError(f"notify 校验失败: {exc}") from exc
+    else:
+        raise ConfigError("notify 必须是映射（mapping）")
+
+    return LoadedConfig(sources=sources, notify=notify)
+
+
+def load_sources(path: str | Path) -> list[SourceConfig]:
+    """兼容旧调用方：只取源列表。"""
+
+    return load_config(path).sources
 
 
 def select_sources(

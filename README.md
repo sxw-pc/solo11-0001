@@ -47,9 +47,28 @@ crawl-flow db stats
 其他可用命令与参数：
 
 ```bash
-crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库
+crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库，也不发通知
+crawl-flow run --all --no-notify        # 临时禁用 webhook 通知（配置不变）
 crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
 crawl-flow db stats --db data/crawl.db
+```
+
+## 采集完成通知
+
+每轮采集结束后，可把各源成功/失败/跳过条数、耗时与失败率汇总成一条 JSON，POST 到 IM 机器人 webhook，适合挂定时任务无人值守时使用。
+
+- 在 `config/sources.yaml` 顶层配置 `notify.webhooks`（支持多个地址逐个推送），单个源可用自己的 `notify.webhooks` 覆盖（只收该源汇总）。
+- 失败率超过 `alert_failure_rate`（默认 0.1）时消息带 `"level": "alert"` 标记。
+- 复用管道自带的 httpx 客户端，无新增依赖；推送有超时与有限次重试，接收端 5xx/超时只打 WARNING，不影响采集退出码。
+- webhook 地址中的密钥在日志里统一脱敏；`--dry-run`、`--no-notify` 或未配置地址时不发出任何通知请求。
+
+```yaml
+notify:
+  webhooks:
+    - https://im.example.com/hooks/xxxxxxxx
+  timeout_seconds: 5
+  retries: 2
+  alert_failure_rate: 0.1
 ```
 
 ## 目录速览

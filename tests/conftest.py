@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from flask import Flask, jsonify, request
 from werkzeug.serving import make_server
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -119,3 +122,63 @@ def source_payload(mock_base_url: str) -> Any:
         return payload
 
     return _payload
+
+
+class WebhookRecorder:
+    """本地通知接收服务：记录收到的请求，并可按需返回指定状态码。"""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.requests: list[dict[str, Any]] = []
+        self.status_code = 200
+        self.slow_seconds = 2.0
+        self._lock = threading.Lock()
+
+    def record(self, payload: dict[str, Any], path: str) -> None:
+        with self._lock:
+            self.requests.append({"path": path, "payload": payload})
+
+    @property
+    def payloads(self) -> list[dict[str, Any]]:
+        return [item["payload"] for item in self.requests]
+
+    def reset(self) -> None:
+        with self._lock:
+            self.requests.clear()
+            self.status_code = 200
+            self.slow_seconds = 2.0
+
+
+@pytest.fixture
+def webhook_server() -> Iterator[WebhookRecorder]:
+    """起一个本地 HTTP 服务模拟 IM 机器人 webhook，测试结束自动关闭。"""
+
+    # werkzeug 自带访问日志会把请求路径（可能含测试密钥）打进 stderr，
+    # 干扰脱敏断言；通知模块自身的日志才是测试对象。
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+    app = Flask(__name__)
+    app.json.ensure_ascii = False
+    recorder = WebhookRecorder("")
+
+    @app.post("/hook/<path:_>")
+    def hook(_: str) -> Any:
+        recorder.record(request.get_json(force=True), request.path)
+        if recorder.status_code == 200:
+            return jsonify({"ok": True})
+        return jsonify({"error": f"simulated {recorder.status_code}"}), recorder.status_code
+
+    @app.post("/slow")
+    def slow() -> Any:
+        time.sleep(recorder.slow_seconds)
+        return jsonify({"ok": True})
+
+    server = make_server("127.0.0.1", 0, app, threaded=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    recorder.url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield recorder
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
