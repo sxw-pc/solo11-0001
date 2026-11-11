@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,9 @@ class RawStore:
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
+        # 并发采集时由 ThreadSafeRawStore 复用本锁，串行化目录创建与写入。
+        # 用 RLock：包装层与本方法可能在同一线程内重入获取。
+        self.lock = threading.RLock()
 
     def save(
         self,
@@ -41,12 +45,13 @@ class RawStore:
         path = directory / f"{safe_external_id(external_id)}.json"
         temp_path = path.with_name(f"{path.name}.tmp")
         try:
-            directory.mkdir(parents=True, exist_ok=True)
-            temp_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temp_path.replace(path)
+            with self.lock:
+                directory.mkdir(parents=True, exist_ok=True)
+                temp_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temp_path.replace(path)
         except OSError as exc:
             raise StoreError(f"原始响应写入失败 path={path} error={exc}") from exc
         return str(path)

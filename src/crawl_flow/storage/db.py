@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,8 @@ class Database:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.engine: Engine = _create_engine(self.path)
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
+        # 并发采集时由 ThreadSafeDatabase 复用本锁，保证多线程写串行化。
+        self.lock = threading.RLock()
 
     def init(self) -> None:
         """创建两张表及索引（幂等）。"""
@@ -67,7 +70,7 @@ class Database:
             "updated_at": _utcnow(),
         }
         try:
-            with self._session_factory() as session:
+            with self.lock, self._session_factory() as session:
                 statement = sqlite_insert(RecordRow).values(**values)
                 statement = statement.on_conflict_do_update(
                     index_elements=["source", "external_id"],
@@ -95,7 +98,7 @@ class Database:
             "raw_path": raw.raw_path,
         }
         try:
-            with self._session_factory() as session:
+            with self.lock, self._session_factory() as session:
                 statement = sqlite_insert(RawRecordRow).values(**values)
                 statement = statement.on_conflict_do_update(
                     index_elements=["source", "external_id"],

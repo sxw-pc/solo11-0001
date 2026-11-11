@@ -37,3 +37,11 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class SchedulerError(CrawlFlowError):
+    """请求调度器内部异常；调用方应降级为串行直连，不中断采集任务。"""
+
+
+class SchedulerDegraded(SchedulerError):
+    """调度器已降级，排队中的请求改由调用方直接执行。"""

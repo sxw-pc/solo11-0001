@@ -1,0 +1,26 @@
+# crawl-flow 请求调度与限流配置
+# 仅在 `crawl-flow run --scheduled` 时生效；默认串行模式不读取本文件。
+# CLI 的 --max-concurrency / --qps 会覆盖这里的同名字段。
+scheduler:
+  # 全局并发上限：所有源在途请求总数的硬上限。
+  max_concurrency: 8
+  # 全局 QPS 上限（毫秒级滑动窗口，null 表示不限制）。
+  qps: 20
+  # 源级缺省值：未在 sources 中单独配置的源使用这些值。
+  default_source_concurrency: 2
+  default_source_qps: null
+  # 单源覆盖：weight 决定加权调度比例（默认 1），高权重源优先获得配额。
+  sources:
+    - name: demo_api
+      max_concurrency: 4
+      qps: 10
+      weight: 3
+    - name: demo_html
+      max_concurrency: 2
+      weight: 1
+  # 域名级限流：触发后对应域名请求自动排队等待，不返回失败。
+  # match=exact 仅匹配完全相同 host；suffix 同时覆盖子域（最长后缀优先）。
+  domain_rules:
+    - domain: 127.0.0.1
+      match: exact
+      qps: 15
