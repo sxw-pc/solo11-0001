@@ -36,6 +36,35 @@ crawl-flow db stats
 
 同一源重复执行不会增加 `records` 行数，只会刷新 `updated_at`。
 
+## 并发运行互斥
+
+同一数据库文件同一时刻只允许一个 `run` 写入进程，避免两个进程同时写
+`data/crawl.db` 触发 `database is locked` 或互相覆盖 raw 文件：
+
+```bash
+# 默认：发现已有 run 在跑，立即报错并以退出码 3 退出（区别于配置/采集/存储错误的 2）
+crawl-flow run --source demo_api
+
+# 可选：排队等锁，前一个进程结束后自动开跑
+crawl-flow run --source demo_api --wait-for-lock
+# 只愿意等 60 秒，超时仍拿不到锁则退出码 3
+crawl-flow run --source demo_api --wait-for-lock --lock-timeout 60
+```
+
+- 互斥基于操作系统级文件锁（POSIX `flock` / Windows `msvcrt`），不是
+  「锁文件存在即占用」：进程被 `kill -9` 或机器重启后，内核自动释放锁，
+  残留的 `*.run.lock` 文件不会挡住后续运行，无需手工清理。
+- 锁按数据库文件区分：不同 `--db` 的运行互不影响。
+- `--dry-run` 不写库也不写 raw，不申请锁：既不会被其他运行挡住，也不会挡住别人。
+- `db stats` 走只读连接，不需要锁，采集进行中也能随时查看。
+- 退出码约定：`0` 成功（含单条详情失败）；`1` 环境类问题（如数据库文件不存在）；
+  `2` 配置/采集/存储错误；`3` 数据库被其他 run 占用。
+
+数据库写连接启用 SQLite WAL 模式并设置 `busy_timeout`：采集写入与只读统计
+可以并发，`db stats` 不再被写事务阻塞。WAL 是数据库的持久化属性，已有老库
+首次被新版本打开时自动从默认日志模式平滑切换，历史数据不受影响（会多出
+`*.db-wal` / `*.db-shm` 侧车文件，属正常现象）。
+
 ## 三条核心命令
 
 | 用途 | 命令 |

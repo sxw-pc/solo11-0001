@@ -5,6 +5,7 @@
 *.db
 *.sqlite
 *.sqlite3
+*.run.lock
 data/
 # Python 缓存
 __pycache__/

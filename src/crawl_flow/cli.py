@@ -9,16 +9,21 @@ from typing import Optional
 import typer
 
 from crawl_flow.config import load_sources, select_sources
-from crawl_flow.errors import ConfigError, FetchError, StoreError
+from crawl_flow.errors import ConfigError, FetchError, LockUnavailable, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
 from crawl_flow.pipeline.run import RunSummary, run_source
 from crawl_flow.storage.db import Database
+from crawl_flow.storage.locking import RunLock
 from crawl_flow.storage.raw_store import RawStore
 
 DEFAULT_CONFIG = Path("config/sources.yaml")
 DEFAULT_DB = Path("data/crawl.db")
 DEFAULT_RAW_DIR = Path("data/raw")
+
+# 退出码约定：0 成功（含单条失败）；1 环境类问题（如 db 文件不存在）；
+# 2 配置/采集/存储错误；3 数据库被另一个 run 占用（部署级互斥锁冲突）。
+EXIT_LOCK_BUSY = 3
 
 app = typer.Typer(
     add_completion=False,
@@ -35,6 +40,17 @@ def run_command(
     all_sources: bool = typer.Option(False, "--all", help="采集所有 enabled 源"),
     limit: Optional[int] = typer.Option(None, "--limit", min=1, help="每个源最多处理 N 条"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只解析，不写 raw 与数据库"),
+    wait_for_lock: bool = typer.Option(
+        False,
+        "--wait-for-lock",
+        help="数据库被占用时排队等待锁，而不是立即失败退出",
+    ),
+    lock_timeout: Optional[float] = typer.Option(
+        None,
+        "--lock-timeout",
+        min=0.0,
+        help="配合 --wait-for-lock：最多等待 N 秒；不指定则一直等到拿到锁",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
     config: Path = typer.Option(DEFAULT_CONFIG, "--config", help="源配置文件路径"),
     db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
@@ -43,6 +59,12 @@ def run_command(
     """跑一轮采集。"""
 
     logger = configure_logging(verbose)
+    if lock_timeout is not None and not wait_for_lock:
+        typer.secho(
+            "提示: --lock-timeout 只在配合 --wait-for-lock 时生效，本次将立即失败",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
     try:
         sources = load_sources(config)
         selected = select_sources(sources, name=source, all_sources=all_sources)
@@ -50,24 +72,68 @@ def run_command(
         typer.secho(f"配置错误: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
-    db = Database(db_path)
+    # dry-run 不写库也不写 raw：不申请互斥锁，既不会被别人挡住，也不会挡别人。
+    if dry_run:
+        try:
+            with Fetcher() as fetcher:
+                summaries = [
+                    run_source(
+                        selected_source,
+                        None,
+                        None,
+                        fetcher=fetcher,
+                        limit=limit,
+                        dry_run=True,
+                        logger=logger,
+                    )
+                    for selected_source in selected
+                ]
+        except FetchError as exc:
+            typer.secho(f"采集失败（整轮中止）: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+        _print_summaries(summaries, dry_run=True)
+        return
+
+    lock = RunLock(db_path)
+    timeout: float | None = 0.0
+    if wait_for_lock:
+        timeout = lock_timeout
+
+    def _notify_waiting() -> None:
+        holder = lock.holder_pid()
+        holder_text = f"（持有者 pid={holder}）" if holder else ""
+        typer.secho(
+            f"数据库 {db_path} 被占用{holder_text}，排队等待锁…",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+    try:
+        lock.acquire(timeout=timeout, on_waiting=_notify_waiting)
+    except LockUnavailable as exc:
+        typer.secho(f"运行被拒绝: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EXIT_LOCK_BUSY) from exc
+
+    db: Database | None = None
     raw_store = RawStore(raw_dir)
     summaries: list[RunSummary] = []
     try:
-        db.init()
-        with Fetcher() as fetcher:
-            for selected_source in selected:
-                summaries.append(
-                    run_source(
-                        selected_source,
-                        db,
-                        raw_store,
-                        fetcher=fetcher,
-                        limit=limit,
-                        dry_run=dry_run,
-                        logger=logger,
+        with lock:
+            db = Database(db_path)
+            db.init()
+            with Fetcher() as fetcher:
+                for selected_source in selected:
+                    summaries.append(
+                        run_source(
+                            selected_source,
+                            db,
+                            raw_store,
+                            fetcher=fetcher,
+                            limit=limit,
+                            dry_run=False,
+                            logger=logger,
+                        )
                     )
-                )
     except FetchError as exc:
         typer.secho(f"采集失败（整轮中止）: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -75,9 +141,11 @@ def run_command(
         typer.secho(f"存储失败: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
     finally:
-        db.close()
+        if db is not None:
+            db.close()
+        lock.release()
 
-    _print_summaries(summaries, dry_run=dry_run)
+    _print_summaries(summaries, dry_run=False)
 
 
 @db_app.command("stats")
@@ -92,7 +160,8 @@ def db_stats(
         typer.secho(f"数据库不存在: {db_path}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    database = Database(db_path)
+    # 只读连接：采集进程写库时也能立刻出表格，不参与运行互斥。
+    database = Database(db_path, read_only=True)
     try:
         database.init()
         stats = database.stats()

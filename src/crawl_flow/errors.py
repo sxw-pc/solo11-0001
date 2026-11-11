@@ -37,3 +37,7 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class LockUnavailable(CrawlFlowError):
+    """同一数据库已有另一个 run 进程持锁，且当前策略不等待或等待超时。"""

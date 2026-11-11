@@ -1,18 +1,28 @@
-"""SQLite 持久化：建表、幂等 upsert、统计查询。"""
+"""SQLite 持久化：建表、幂等 upsert、统计查询。
+
+写连接启用 WAL 与 ``busy_timeout``：采集写入时，``db stats`` 这类只读连接
+不会被写事务阻塞（WAL 允许读写并发），遇到瞬时锁也会等待而不是立刻报
+``database is locked``。只读连接以 ``mode=ro`` 的 SQLite URI 打开，
+物理上无法写入，也不会被部署级运行锁拦截。
+"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, event, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
 from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+
+# 写连接遇到锁时的等待上限（毫秒）；配合部署级互斥锁，正常不会触发。
+BUSY_TIMEOUT_MS = 5000
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -33,18 +43,25 @@ def _utcnow() -> datetime:
 
 
 class Database:
-    """单文件 SQLite 数据库封装，所有 SQLAlchemy 异常统一转 :class:`StoreError`。"""
+    """单文件 SQLite 数据库封装，所有 SQLAlchemy 异常统一转 :class:`StoreError`。
 
-    def __init__(self, path: str | Path) -> None:
+    ``read_only=True`` 时以只读 URI 打开（供 ``db stats`` 使用）：不会创建
+    数据库文件、不会被写事务阻塞，也不可能误写。
+    """
+
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
-        if str(self.path) != ":memory:":
+        self.read_only = read_only
+        if str(self.path) != ":memory:" and not read_only:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.engine: Engine = _create_engine(self.path)
+        self.engine: Engine = _create_engine(self.path, read_only=read_only)
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def init(self) -> None:
-        """创建两张表及索引（幂等）。"""
+        """创建两张表及索引（幂等）；只读连接下为空操作。"""
 
+        if self.read_only:
+            return
         try:
             Base.metadata.create_all(self.engine)
         except SQLAlchemyError as exc:
@@ -182,9 +199,36 @@ class Database:
         self.engine.dispose()
 
 
-def _create_engine(path: Path) -> Engine:
+def _create_engine(path: Path, *, read_only: bool) -> Engine:
     from sqlalchemy import create_engine
 
     if str(path) == ":memory:":
-        return create_engine("sqlite://", future=True)
-    return create_engine(f"sqlite:///{path}", future=True)
+        engine = create_engine("sqlite://", future=True)
+    elif read_only:
+        # 只读 URI：文件不存在时 SQLite 直接报错，不会被悄悄创建。
+        uri_path = "file:" + quote(str(path.resolve()), safe="/")
+        engine = create_engine(
+            f"sqlite:///{uri_path}?uri=true&mode=ro",
+            future=True,
+        )
+    else:
+        engine = create_engine(f"sqlite:///{path}", future=True)
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:  # noqa: ANN001
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            if read_only:
+                # 双保险：连接级禁止写，哪怕上层误用 ORM 也写不进去。
+                cursor.execute("PRAGMA query_only=ON")
+            else:
+                # WAL 是持久化属性，对老库首次连上即完成切换，之后所有连接
+                # （含只读连接）都按 WAL 工作；读写不再互相阻塞。
+                cursor.execute("PRAGMA journal_mode=WAL")
+                # WAL 下 NORMAL 足够安全且更快，避免每次提交都 fsync。
+                cursor.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cursor.close()
+
+    return engine

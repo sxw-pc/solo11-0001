@@ -47,8 +47,8 @@ class RunSummary:
 
 def run_source(
     source: SourceConfig,
-    db: Database,
-    raw_store: RawStore,
+    db: Database | None,
+    raw_store: RawStore | None,
     *,
     fetcher: Fetcher | None = None,
     limit: int | None = None,
@@ -59,7 +59,11 @@ def run_source(
 
     列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
+    ``dry_run=True`` 不触碰数据库与 raw 目录，因此两者允许传 ``None``。
     """
+
+    if not dry_run and (db is None or raw_store is None):
+        raise ValueError("非 dry-run 模式必须提供 db 与 raw_store")
 
     log = logger or logging.getLogger(LOGGER_NAME)
     owns_fetcher = fetcher is None
@@ -117,8 +121,8 @@ def process_item(
     adapter: SourceAdapter,
     item: ListItem,
     *,
-    db: Database,
-    raw_store: RawStore,
+    db: Database | None,
+    raw_store: RawStore | None,
     dry_run: bool,
     logger: logging.Logger,
 ) -> ItemOutcome:
@@ -184,6 +188,7 @@ def process_item(
         )
 
     if not dry_run:
+        assert raw_store is not None and db is not None
         raw_path = raw_store.save(
             source=source.name,
             external_id=item.external_id,
@@ -213,8 +218,8 @@ def _fail(
     source_name: str,
     item: ListItem,
     *,
-    db: Database,
-    raw_store: RawStore,
+    db: Database | None,
+    raw_store: RawStore | None,
     dry_run: bool,
     logger: logging.Logger,
     error: str,
@@ -224,6 +229,7 @@ def _fail(
 ) -> ItemOutcome:
     summary = error.strip().replace("\n", " ")[:MAX_ERROR_LENGTH]
     if not dry_run:
+        assert raw_store is not None and db is not None
         payload = _failure_payload(source_name, item, fetched_at, summary, result)
         raw_path = raw_store.save(
             source=source_name,
