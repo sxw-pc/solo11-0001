@@ -103,3 +103,24 @@ class RecordRow(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # title + content 归一化后的 SHA-256 指纹；旧库迁移前为 NULL，init() 会回填。
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class RecordVersionRow(Base):
+    """``record_versions``：records 内容哈希的版本时间线，(source, external_id, version) 唯一。"""
+
+    __tablename__ = "record_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "source", "external_id", "version", name="uq_record_versions_source_external_version"
+        ),
+        Index("ix_record_versions_source_external", "source", "external_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

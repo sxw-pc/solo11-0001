@@ -34,7 +34,7 @@ crawl-flow run --source demo_html --limit 5
 crawl-flow db stats
 ```
 
-同一源重复执行不会增加 `records` 行数，只会刷新 `updated_at`。
+同一源重复执行不会增加 `records` 行数，只会刷新 `updated_at`；内容变化时会在 `record_versions` 追加一个版本（版本号从 1 起步），可用 `crawl-flow db history` 查看版本时间线。
 
 ## 三条核心命令
 
@@ -50,6 +50,7 @@ crawl-flow db stats
 crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库
 crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
 crawl-flow db stats --db data/crawl.db
+crawl-flow db history --source demo_api # 查看记录版本时间线
 ```
 
 ## 目录速览
@@ -71,7 +72,7 @@ crawl-flow/
 
 1. **增量游标 / 断点续采**：每次从列表第 1 页全量重扫，没有游标与断点。
 2. **并发抓取 / 全局限速 / 代理池**：单线程串行请求，无速率控制、无代理。
-3. **内容指纹去重**：只保证 `(source, external_id)` 唯一，不做正文指纹。
+3. **内容指纹去重**：只保证 `(source, external_id)` 唯一；`content_hash` 仅用于版本历史，不做跨源/跨 ID 去重。
 4. **重试退避 / 死信队列 / 失败重放**：仅对连接级传输异常做一次立即重试，5xx 不重试，失败只留档不自动重放。
 5. **清洗规则 DSL / 字段质量校验**：清洗逻辑固定在代码中，不做可配置 DSL 与质量评分。
 6. **任务编排 / 定时调度 / 指标暴露**：只能手动执行 CLI，无调度器与监控指标。

@@ -31,6 +31,7 @@ class ItemOutcome:
     status: str
     elapsed_ms: int
     error: str | None = None
+    changed: bool = False
 
 
 @dataclass
@@ -41,6 +42,7 @@ class RunSummary:
     ok: int = 0
     failed: int = 0
     skipped: int = 0
+    changed: int = 0
     elapsed_ms: int = 0
     results: list[ItemOutcome] = field(default_factory=list)
 
@@ -94,6 +96,8 @@ def run_source(
                 summary.results.append(outcome)
                 if outcome.status == "ok":
                     summary.ok += 1
+                    if outcome.changed:
+                        summary.changed += 1
                 else:
                     summary.failed += 1
     finally:
@@ -102,11 +106,12 @@ def run_source(
 
     summary.elapsed_ms = int((time.perf_counter() - started) * 1000)
     log.info(
-        "run summary source=%s ok=%d failed=%d skipped=%d elapsed_ms=%d dry_run=%s",
+        "run summary source=%s ok=%d failed=%d skipped=%d changed=%d elapsed_ms=%d dry_run=%s",
         summary.source,
         summary.ok,
         summary.failed,
         summary.skipped,
+        summary.changed,
         summary.elapsed_ms,
         str(dry_run).lower(),
     )
@@ -202,11 +207,18 @@ def process_item(
                 raw_path=raw_path,
             )
         )
-        db.upsert_record(record)
+        changed = db.upsert_record(record)
+    else:
+        changed = False
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_item(logger, source.name, item.external_id, "ok", elapsed_ms)
-    return ItemOutcome(external_id=item.external_id, status="ok", elapsed_ms=elapsed_ms)
+    return ItemOutcome(
+        external_id=item.external_id,
+        status="ok",
+        elapsed_ms=elapsed_ms,
+        changed=changed,
+    )
 
 
 def _fail(

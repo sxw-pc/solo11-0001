@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -116,6 +117,53 @@ def db_stats(
     )
 
 
+@db_app.command("history")
+def db_history(
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="只看指定源"),
+    external_id: Optional[str] = typer.Option(
+        None, "--external-id", "-e", help="只看指定源内记录"
+    ),
+    limit: int = typer.Option(100, "--limit", min=1, help="最多显示 N 行"),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
+) -> None:
+    """查看 record_versions 版本时间线。"""
+
+    configure_logging(verbose)
+    if not db_path.exists():
+        typer.secho(f"数据库不存在: {db_path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    database = Database(db_path)
+    try:
+        database.init()
+        rows = database.history(source=source, external_id=external_id, limit=limit)
+    except StoreError as exc:
+        typer.secho(f"版本查询失败: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    finally:
+        database.close()
+
+    if not rows:
+        typer.echo("（无版本记录）")
+        return
+
+    typer.echo(
+        f"{'source':<24}{'external_id':<20}{'version':>8}  {'content_hash':<64}  created_at"
+    )
+    for row in rows:
+        created = row["created_at"]
+        created_text = (
+            created.isoformat(sep=" ", timespec="seconds")
+            if isinstance(created, datetime)
+            else str(created)
+        )
+        typer.echo(
+            f"{row['source']:<24}{row['external_id']:<20}{row['version']:>8}  "
+            f"{row['content_hash']:<64}  {created_text}"
+        )
+
+
 @app.command("serve-mock")
 def serve_mock(
     port: int = typer.Option(8010, "--port", min=1, max=65535, help="监听端口"),
@@ -146,13 +194,15 @@ def _print_summaries(summaries: list[RunSummary], *, dry_run: bool) -> None:
     for summary in summaries:
         typer.echo(
             f"source={summary.source} ok={summary.ok} failed={summary.failed} "
-            f"skipped={summary.skipped} elapsed_ms={summary.elapsed_ms}"
+            f"skipped={summary.skipped} changed={summary.changed} "
+            f"elapsed_ms={summary.elapsed_ms}"
         )
     if summaries:
         typer.echo(
             f"total ok={sum(s.ok for s in summaries)} "
             f"failed={sum(s.failed for s in summaries)} "
-            f"skipped={sum(s.skipped for s in summaries)}"
+            f"skipped={sum(s.skipped for s in summaries)} "
+            f"changed={sum(s.changed for s in summaries)}"
         )
 
 
