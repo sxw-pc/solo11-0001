@@ -1,0 +1,32 @@
+# crawl-flow 内容指纹与去重配置（独立于 sources.yaml，缺失时全部使用默认值）
+# 调整 rule 下的任何规则后，请递增 rule.version，再执行：
+#   crawl-flow dedup recompute
+# 以便按新版本批量重算历史条目的指纹与标记。
+
+# 指纹独立 SQLite 文件，与采集主库 data/crawl.db 物理隔离。
+fingerprint_db: data/fingerprints.db
+
+rule:
+  # 规则版本号：规则变更后递增，历史指纹按版本区分、支持批量重算。
+  version: 1
+  # 精确指纹哈希算法，可选 sha256 / sha1 / md5 / blake2b。
+  hash_algorithm: sha256
+  # 归一化时是否统一小写（casefold，对中英文均生效）。
+  lowercase: true
+  # 是否剥离标点与符号后再计算指纹（剥离后跨源标点差异不影响指纹）。
+  strip_punctuation: true
+  # 中文是否生成相邻字符 bigram，提升 SimHash 对局部改动的稳定性。
+  cjk_bigram: true
+  # 正文归一化后短于该字符数则跳过，不生成无效指纹。
+  min_content_length: 20
+  # 标题归一化后短于该字符数则跳过标题哈希。
+  min_title_length: 2
+
+similarity:
+  # 是否启用 SimHash 近似重复识别（精确哈希始终启用）。
+  enabled: true
+  # 相似度阈值 [0,1]：SimHash 相似度达到该值才标记为 similar，低于不标记。
+  # 0.9 对应 64 位指纹汉明距离 <= 6。
+  threshold: 0.9
+  # LSH 分带数（必须能整除 64，可选 1/2/4/8）：越大召回越高、计算略增。
+  bands: 4

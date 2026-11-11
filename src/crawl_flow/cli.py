@@ -9,6 +9,7 @@ from typing import Optional
 import typer
 
 from crawl_flow.config import load_sources, select_sources
+from crawl_flow.dedup.cli import dedup_app
 from crawl_flow.errors import ConfigError, FetchError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
@@ -27,6 +28,8 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="数据库运维命令", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+# 独立内容指纹与去重命令组：只读主库、写独立指纹库，不影响 run 的入库逻辑。
+app.add_typer(dedup_app, name="dedup")
 
 
 @app.command("run")
