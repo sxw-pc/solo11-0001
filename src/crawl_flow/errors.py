@@ -37,3 +37,35 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class BudgetError(CrawlFlowError):
+    """请求预算账本相关异常的基类。"""
+
+
+class BudgetExceeded(BudgetError):
+    """源当日预算额度触顶，触发熔断：该源停止后续抓取（不影响其他源）。"""
+
+    def __init__(
+        self,
+        source: str,
+        *,
+        kind: str,
+        limit: int,
+        used: int,
+        day: str,
+    ) -> None:
+        self.source = source
+        self.kind = kind  # "requests" 或 "bytes"
+        self.limit = limit
+        self.used = used
+        self.day = day
+        label = "请求次数" if kind == "requests" else "响应字节"
+        super().__init__(
+            f"源 {source} 当日{label}额度触顶: day={day} 已用={used} 上限={limit}，"
+            f"该源后续抓取已熔断"
+        )
+
+
+class BudgetLedgerError(BudgetError):
+    """预算账本损坏或读写失败；为避免静默丢账，拒绝继续运行。"""

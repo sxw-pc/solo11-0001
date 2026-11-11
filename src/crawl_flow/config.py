@@ -31,6 +31,21 @@ class FieldMapping(BaseModel):
     url: str | None = None
 
 
+class BudgetConfig(BaseModel):
+    """单个源的每日请求预算。两个维度各自独立，缺省即该维度不限。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    daily_request_limit: int | None = Field(default=None, ge=1)
+    daily_byte_limit: int | None = Field(default=None, ge=1)
+
+    @property
+    def has_limits(self) -> bool:
+        """是否至少声明了一个额度；False 时该源完全不记账。"""
+
+        return self.daily_request_limit is not None or self.daily_byte_limit is not None
+
+
 class SourceConfig(BaseModel):
     """单个源的配置。"""
 
@@ -45,6 +60,7 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    budget: BudgetConfig | None = None
 
     @field_validator("base_url")
     @classmethod
