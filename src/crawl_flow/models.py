@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import (
@@ -102,4 +102,60 @@ class RecordRow(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class WideRecordRow(Base):
+    """``wide_records``：跨源合并后的统一宽表，(table_name, entity_key) 唯一。
+
+    宽表字段按配置动态生成，统一存进 ``fields`` JSON，避免为每张宽表
+    物理建表；``table_name`` 由配置白名单校验，不可注入。
+    """
+
+    __tablename__ = "wide_records"
+    __table_args__ = (
+        UniqueConstraint("table_name", "entity_key", name="uq_wide_records_table_entity"),
+        Index("ix_wide_records_table_status", "table_name", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    table_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    entity_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    # ok：唯一命中；conflict：多命中按冲突策略合并
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    primary_source: Mapped[str] = mapped_column(String(128), nullable=False)
+    sources: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    fields: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    conflict_detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CorrelationEventRow(Base):
+    """``correlation_events``：关联失败/冲突留痕，不中断主采集流程。
+
+    同一条本地记录的同一事件类型按 (local_source, local_external_id,
+    event_type) 幂等覆盖。
+    """
+
+    __tablename__ = "correlation_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "local_source",
+            "local_external_id",
+            "event_type",
+            name="uq_correlation_events_record_type",
+        ),
+        Index("ix_correlation_events_type", "event_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    table_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    local_source: Mapped[str] = mapped_column(String(128), nullable=False)
+    local_external_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    remote_source: Mapped[str] = mapped_column(String(128), nullable=False)
+    # missing_field / type_mismatch / not_matched / conflict / error
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

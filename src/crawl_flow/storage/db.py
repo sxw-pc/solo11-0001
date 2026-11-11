@@ -12,7 +12,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
-from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+from crawl_flow.models import (
+    Base,
+    CorrelationEventRow,
+    RawRecord,
+    RawRecordRow,
+    Record,
+    RecordRow,
+    WideRecordRow,
+)
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -26,6 +34,18 @@ RECORD_UPDATE_FIELDS = (
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+
+WIDE_UPDATE_FIELDS = (
+    "status",
+    "primary_source",
+    "sources",
+    "fields",
+    "conflict_detail",
+    "fetched_at",
+    "updated_at",
+)
+
+EVENT_UPDATE_FIELDS = ("detail", "updated_at")
 
 
 def _utcnow() -> datetime:
@@ -123,6 +143,133 @@ class Database:
                 statement = statement.where(RawRecordRow.source == source)
             if status is not None:
                 statement = statement.where(RawRecordRow.status == status)
+            return int(session.execute(statement).scalar_one())
+
+    def load_records(self, source: str) -> list[Record]:
+        """一次性加载某源的全部归一化记录，用于预加载关联索引。
+
+        避免关联时逐行查询：每个关联源一轮采集只产生一次 SQL。
+        """
+
+        with Session(self.engine) as session:
+            rows = (
+                session.execute(
+                    select(RecordRow)
+                    .where(RecordRow.source == source)
+                    .order_by(RecordRow.external_id)
+                )
+                .scalars()
+                .all()
+            )
+            return [
+                Record(
+                    source=row.source,
+                    external_id=row.external_id,
+                    title=row.title,
+                    category=row.category,
+                    tags=list(row.tags or []),
+                    published_at=row.published_at,
+                    content=row.content,
+                    url=row.url,
+                    fetched_at=row.fetched_at,
+                )
+                for row in rows
+            ]
+
+    def upsert_wide_record(
+        self,
+        *,
+        table_name: str,
+        entity_key: str,
+        status: str,
+        primary_source: str,
+        sources: list[str],
+        fields: dict[str, Any],
+        conflict_detail: dict[str, Any] | None,
+        fetched_at: datetime,
+    ) -> None:
+        """按 (table_name, entity_key) 幂等写入宽表，重复采集只更新不增行。"""
+
+        values = {
+            "table_name": table_name,
+            "entity_key": entity_key,
+            "status": status,
+            "primary_source": primary_source,
+            "sources": list(sources),
+            "fields": dict(fields),
+            "conflict_detail": conflict_detail,
+            "fetched_at": fetched_at,
+            "updated_at": _utcnow(),
+        }
+        try:
+            with self._session_factory() as session:
+                statement = sqlite_insert(WideRecordRow).values(**values)
+                statement = statement.on_conflict_do_update(
+                    index_elements=["table_name", "entity_key"],
+                    set_={field: statement.excluded[field] for field in WIDE_UPDATE_FIELDS},
+                )
+                session.execute(statement)
+                session.commit()
+        except SQLAlchemyError as exc:
+            raise StoreError(
+                f"wide_records 写入失败 table={table_name} "
+                f"entity_key={entity_key} error={exc}"
+            ) from exc
+
+    def upsert_correlation_event(
+        self,
+        *,
+        table_name: str,
+        local_source: str,
+        local_external_id: str,
+        remote_source: str,
+        event_type: str,
+        detail: dict[str, Any],
+    ) -> None:
+        """按 (local_source, local_external_id, event_type) 幂等写入关联事件。"""
+
+        now = _utcnow()
+        values = {
+            "table_name": table_name,
+            "local_source": local_source,
+            "local_external_id": local_external_id,
+            "remote_source": remote_source,
+            "event_type": event_type,
+            "detail": dict(detail),
+            "created_at": now,
+            "updated_at": now,
+        }
+        try:
+            with self._session_factory() as session:
+                statement = sqlite_insert(CorrelationEventRow).values(**values)
+                statement = statement.on_conflict_do_update(
+                    index_elements=["local_source", "local_external_id", "event_type"],
+                    set_={field: statement.excluded[field] for field in EVENT_UPDATE_FIELDS},
+                )
+                session.execute(statement)
+                session.commit()
+        except SQLAlchemyError as exc:
+            raise StoreError(
+                f"correlation_events 写入失败 source={local_source} "
+                f"external_id={local_external_id} event={event_type} error={exc}"
+            ) from exc
+
+    def count_wide_records(self, table_name: str | None = None) -> int:
+        with Session(self.engine) as session:
+            statement = select(func.count()).select_from(WideRecordRow)
+            if table_name is not None:
+                statement = statement.where(WideRecordRow.table_name == table_name)
+            return int(session.execute(statement).scalar_one())
+
+    def count_correlation_events(
+        self, event_type: str | None = None, table_name: str | None = None
+    ) -> int:
+        with Session(self.engine) as session:
+            statement = select(func.count()).select_from(CorrelationEventRow)
+            if event_type is not None:
+                statement = statement.where(CorrelationEventRow.event_type == event_type)
+            if table_name is not None:
+                statement = statement.where(CorrelationEventRow.table_name == table_name)
             return int(session.execute(statement).scalar_one())
 
     def stats(self) -> dict[str, Any]:

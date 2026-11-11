@@ -36,6 +36,39 @@ crawl-flow db stats
 
 同一源重复执行不会增加 `records` 行数，只会刷新 `updated_at`。
 
+## 跨源关联与宽表
+
+关联能力**默认关闭**：只有源配置中显式声明 `correlation` 规则时才生效，未配置的源执行逻辑完全不变。启用后，采集该源时会一次性预加载关联源的记录索引（每轮仅一次 SQL，不逐行查询），按关联键等值匹配，把多源同实体记录合并进统一宽表 `wide_records`；关联失败只在 `correlation_events` 留痕，原始单源数据保留、主采集流程不中断。
+
+```yaml
+- name: demo_api
+  type: api
+  base_url: http://127.0.0.1:8010
+  correlation:
+    enabled: true                # 可省略，默认 true；false 时整条规则不生效
+    remote_source: demo_html
+    join_keys:                   # 支持多键；coerce: string(默认)/integer/datetime
+      - local_field: title
+        remote_field: title
+        coerce: string
+    wide_table:
+      table: article_wide
+      conflict_policy: merge     # merge(默认) 多命中合并并标记 conflict；skip 只留痕
+      fields:                    # strategy: first(默认)/concat/list
+        - name: title
+          sources: [demo_api, demo_html]
+          strategy: first
+        - name: tags
+          sources: [demo_api, demo_html]
+          strategy: list
+        - name: html_url
+          field: url
+          sources: [demo_html]
+          default: ""
+```
+
+异常处理：关联键为空记 `missing_field`；`integer`/`datetime` 归一化失败记 `type_mismatch`；无匹配记 `not_matched`；一键多值记 `conflict`。宽表与事件均按唯一键幂等 upsert，重复采集不产生冗余行；`--dry-run` 下关联同样不执行。
+
 ## 三条核心命令
 
 | 用途 | 命令 |
@@ -71,7 +104,7 @@ crawl-flow/
 
 1. **增量游标 / 断点续采**：每次从列表第 1 页全量重扫，没有游标与断点。
 2. **并发抓取 / 全局限速 / 代理池**：单线程串行请求，无速率控制、无代理。
-3. **内容指纹去重**：只保证 `(source, external_id)` 唯一，不做正文指纹。
+3. **内容指纹去重**：只保证 `(source, external_id)` 唯一及配置驱动的跨源关联，不做正文哈希与模糊去重。
 4. **重试退避 / 死信队列 / 失败重放**：仅对连接级传输异常做一次立即重试，5xx 不重试，失败只留档不自动重放。
 5. **清洗规则 DSL / 字段质量校验**：清洗逻辑固定在代码中，不做可配置 DSL 与质量评分。
 6. **任务编排 / 定时调度 / 指标暴露**：只能手动执行 CLI，无调度器与监控指标。

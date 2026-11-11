@@ -14,6 +14,7 @@ from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
 from crawl_flow.models import RawRecord
 from crawl_flow.observability.logging import log_item
+from crawl_flow.pipeline.correlation import Correlator
 from crawl_flow.pipeline.normalize import normalize_record
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
 from crawl_flow.storage.db import Database
@@ -43,6 +44,9 @@ class RunSummary:
     skipped: int = 0
     elapsed_ms: int = 0
     results: list[ItemOutcome] = field(default_factory=list)
+    # 跨源关联统计（未配置关联时始终为 0，不影响原有汇总输出）
+    wide_merged: int = 0
+    correlation_failed: int = 0
 
 
 def run_source(
@@ -70,6 +74,10 @@ def run_source(
     seen: set[str] = set()
     processed = 0
 
+    # 仅当显式配置关联规则且非 dry-run 时启用；未配置时此对象恒为 None，
+    # 后续流程与原单源管道完全一致。
+    correlator = _build_correlator(source, db, dry_run, log)
+
     try:
         for page in adapter.iter_list_pages():
             for item in page.items:
@@ -90,6 +98,8 @@ def run_source(
                     raw_store=raw_store,
                     dry_run=dry_run,
                     logger=log,
+                    correlator=correlator,
+                    summary=summary,
                 )
                 summary.results.append(outcome)
                 if outcome.status == "ok":
@@ -110,7 +120,40 @@ def run_source(
         summary.elapsed_ms,
         str(dry_run).lower(),
     )
+    if correlator is not None:
+        log.info(
+            "correlation summary source=%s wide_merged=%d correlation_failed=%d",
+            summary.source,
+            summary.wide_merged,
+            summary.correlation_failed,
+        )
     return summary
+
+
+def _build_correlator(
+    source: SourceConfig,
+    db: Database,
+    dry_run: bool,
+    log: logging.Logger,
+) -> Correlator | None:
+    """按配置决定是否构建关联器；预加载失败不阻断主采集（降级为不关联）。"""
+
+    correlation = source.correlation
+    if dry_run or correlation is None or not correlation.enabled:
+        return None
+    correlator = Correlator(source.name, correlation, db, logger=log)
+    try:
+        correlator.preload()
+    except Exception as exc:  # 预加载失败：本轮关闭关联，单源采集照常
+        log.warning(
+            "correlation preload failed, fallback to single-source "
+            "source=%s remote=%s error=%s",
+            source.name,
+            correlation.remote_source,
+            exc,
+        )
+        return None
+    return correlator
 
 
 def process_item(
@@ -121,6 +164,8 @@ def process_item(
     raw_store: RawStore,
     dry_run: bool,
     logger: logging.Logger,
+    correlator: Correlator | None = None,
+    summary: RunSummary | None = None,
 ) -> ItemOutcome:
     """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。"""
 
@@ -203,6 +248,15 @@ def process_item(
             )
         )
         db.upsert_record(record)
+
+    if correlator is not None and not dry_run:
+        # 关联是旁路：失败只留痕并计数，不改变本条 ok/failed 结果
+        correlation_result = correlator.on_record(record)
+        if summary is not None:
+            if correlation_result.wide_written:
+                summary.wide_merged += 1
+            else:
+                summary.correlation_failed += 1
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_item(logger, source.name, item.external_id, "ok", elapsed_ms)

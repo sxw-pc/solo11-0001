@@ -68,3 +68,43 @@ sources:
       published_at: published_at
       content: content
       url: null
+
+  # 跨源关联示例（默认注释，不启用）。
+  # 取消注释后，采集 demo_api 时会预加载 demo_html 的记录索引，
+  # 按 title 等值匹配把两源数据合并进 article_wide 宽表。
+  # - name: demo_api
+  #   type: api
+  #   base_url: http://127.0.0.1:8010
+  #   enabled: false
+  #   page_size: 5
+  #   correlation:
+  #     # 可省略，默认 true；显式 false 时整条关联规则不生效
+  #     enabled: true
+  #     remote_source: demo_html
+  #     join_keys:
+  #       # coerce 可选 string（默认）/ integer / datetime，
+  #       # integer/datetime 转换失败会记 type_mismatch 事件
+  #       - local_field: title
+  #         remote_field: title
+  #         coerce: string
+  #     wide_table:
+  #       table: article_wide
+  #       # merge（默认）：多命中合并为一行并标记 conflict；skip：只留痕不写宽表
+  #       conflict_policy: merge
+  #       fields:
+  #         # strategy 可选 first（默认）/ concat / list
+  #         - name: title
+  #           sources: [demo_api, demo_html]
+  #           strategy: first
+  #         - name: tags
+  #           sources: [demo_api, demo_html]
+  #           strategy: list
+  #         - name: sources
+  #           field: source
+  #           sources: [demo_api, demo_html]
+  #           strategy: concat
+  #           separator: ","
+  #         - name: html_url
+  #           field: url
+  #           sources: [demo_html]
+  #           default: ""

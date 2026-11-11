@@ -144,10 +144,17 @@ def _print_summaries(summaries: list[RunSummary], *, dry_run: bool) -> None:
     mode = "（dry-run，未写 raw 与数据库）" if dry_run else ""
     typer.echo(f"本轮汇总{mode}")
     for summary in summaries:
-        typer.echo(
+        line = (
             f"source={summary.source} ok={summary.ok} failed={summary.failed} "
             f"skipped={summary.skipped} elapsed_ms={summary.elapsed_ms}"
         )
+        # 仅在显式启用跨源关联时追加关联统计，未配置的源输出保持原样
+        if summary.wide_merged or summary.correlation_failed:
+            line += (
+                f" wide_merged={summary.wide_merged} "
+                f"correlation_failed={summary.correlation_failed}"
+            )
+        typer.echo(line)
     if summaries:
         typer.echo(
             f"total ok={sum(s.ok for s in summaries)} "
