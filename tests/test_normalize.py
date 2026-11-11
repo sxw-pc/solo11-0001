@@ -50,6 +50,59 @@ def test_parse_datetime_supports_iso_and_local_formats() -> None:
     assert parse_datetime("") is None
 
 
+def test_parse_datetime_supports_chinese_and_relative_and_fullwidth() -> None:
+    anchor = datetime(2024, 5, 10, 12, 0, 0)
+    # 非补零中文日期
+    assert parse_datetime("2024年5月1日") == datetime(2024, 5, 1)
+    assert parse_datetime("2024年3月7日 08:15") == datetime(2024, 3, 7, 8, 15)
+    # 相对时间锚定显式 anchor
+    assert parse_datetime("3天前", anchor=anchor) == datetime(2024, 5, 7, 12, 0)
+    assert parse_datetime("刚刚", anchor=anchor) == anchor
+    # 全角字符、首尾空白与换行先清洗再解析
+    assert parse_datetime("　２０２４－０３－０１　") == datetime(2024, 3, 1)
+    assert parse_datetime("\n\t 2024-03-01 09:30 \n") == datetime(2024, 3, 1, 9, 30)
+    assert parse_datetime("2024年5月1日\r\n") == datetime(2024, 5, 1)
+    # 无法识别仍为 NULL
+    assert parse_datetime("昨天", anchor=anchor) is None
+
+
+def test_normalize_record_anchors_relative_time_to_fetched_at() -> None:
+    source = SourceConfig(
+        name="custom",
+        type="html",
+        base_url="http://127.0.0.1:1",
+        field_map=FieldMapping(title="title", published_at="date"),
+    )
+    fetched_at = datetime(2024, 5, 10, 12, 0, tzinfo=timezone.utc)
+    record = normalize_record(
+        source,
+        "x-9",
+        {"title": "标题", "date": " ３天前\n"},
+        detail_url="http://detail.test/x-9",
+        fetched_at=fetched_at,
+    )
+    # 相对时间以本条记录的 fetched_at（naive UTC）为锚点，结果可复现
+    assert record.published_at == datetime(2024, 5, 7, 12, 0)
+    assert record.published_at is not None and record.published_at.tzinfo is None
+
+
+def test_normalize_record_keeps_unparseable_date_null() -> None:
+    source = SourceConfig(
+        name="custom",
+        type="html",
+        base_url="http://127.0.0.1:1",
+        field_map=FieldMapping(title="title", published_at="date"),
+    )
+    record = normalize_record(
+        source,
+        "x-10",
+        {"title": "标题", "date": "发布日期待定"},
+        detail_url="http://detail.test/x-10",
+        fetched_at=datetime(2024, 5, 10, tzinfo=timezone.utc),
+    )
+    assert record.published_at is None
+
+
 def test_normalize_record_uses_field_map() -> None:
     source = SourceConfig(
         name="custom",

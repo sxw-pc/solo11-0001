@@ -18,6 +18,7 @@ from crawl_flow.pipeline.normalize import normalize_record
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
+from crawl_flow.timeutils import utc_storage_text
 
 LOGGER_NAME = "crawl_flow.pipeline"
 MAX_ERROR_LENGTH = 500
@@ -269,7 +270,7 @@ def _success_payload(
         "external_id": item.external_id,
         "url": result.url,
         "status": result.status_code,
-        "fetched_at": fetched_at.isoformat(),
+        "fetched_at": utc_storage_text(fetched_at),
         "headers": result.headers,
         "body": result.body,
     }
@@ -287,7 +288,7 @@ def _failure_payload(
         "external_id": item.external_id,
         "url": result.url if result is not None else item.url,
         "status": result.status_code if result is not None else None,
-        "fetched_at": fetched_at.isoformat(),
+        "fetched_at": utc_storage_text(fetched_at),
         "headers": result.headers if result is not None else {},
         "body": result.body if result is not None else "",
         "error": error,

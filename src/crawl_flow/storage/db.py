@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
 from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+from crawl_flow.timeutils import to_utc_naive
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -51,20 +52,28 @@ class Database:
             raise StoreError(f"建表失败 db={self.path} error={exc}") from exc
 
     def upsert_record(self, record: Record) -> None:
-        """按 (source, external_id) 幂等写入；重复采集只更新内容与时间戳。"""
+        """按 (source, external_id) 幂等写入；重复采集只更新内容与时间戳。
 
-        fetched_at = record.fetched_at or _utcnow()
+        所有时间字段在写库前统一转成无时区 UTC，SQLite 中只存
+        ``YYYY-MM-DD HH:MM:SS`` 形态，不混入时区偏移文本。
+        """
+
+        fetched_at = to_utc_naive(record.fetched_at or _utcnow())
         values = {
             "source": record.source,
             "external_id": record.external_id,
             "title": record.title,
             "category": record.category,
             "tags": list(record.tags),
-            "published_at": record.published_at,
+            "published_at": (
+                to_utc_naive(record.published_at)
+                if record.published_at is not None
+                else None
+            ),
             "content": record.content,
             "url": record.url,
             "fetched_at": fetched_at,
-            "updated_at": _utcnow(),
+            "updated_at": to_utc_naive(_utcnow()),
         }
         try:
             with self._session_factory() as session:
@@ -89,7 +98,7 @@ class Database:
             "external_id": raw.external_id,
             "url": raw.url,
             "http_status": raw.http_status,
-            "fetched_at": raw.fetched_at,
+            "fetched_at": to_utc_naive(raw.fetched_at),
             "status": raw.status,
             "error": raw.error,
             "raw_path": raw.raw_path,

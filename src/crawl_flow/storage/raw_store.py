@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from crawl_flow.errors import StoreError
+from crawl_flow.timeutils import utc_date_text
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 MAX_ID_LENGTH = 120
@@ -35,9 +36,13 @@ class RawStore:
         payload: dict[str, Any],
         fetched_at: datetime,
     ) -> str:
-        """原子写入一份原始响应，返回文件路径；失败抛 :class:`StoreError`。"""
+        """原子写入一份原始响应，返回文件路径；失败抛 :class:`StoreError`。
 
-        directory = self.root / source / fetched_at.strftime("%Y-%m-%d")
+        分目录日期严格取本条记录 ``fetched_at`` 的 UTC 日期，与
+        ``raw_records.fetched_at`` 的 UTC 日期保持一致，不使用进程启动时间。
+        """
+
+        directory = self.root / source / utc_date_text(fetched_at)
         path = directory / f"{safe_external_id(external_id)}.json"
         temp_path = path.with_name(f"{path.name}.tmp")
         try:
