@@ -43,6 +43,7 @@ class RunSummary:
     skipped: int = 0
     elapsed_ms: int = 0
     results: list[ItemOutcome] = field(default_factory=list)
+    fatal_error: str | None = None
 
 
 def run_source(
@@ -57,7 +58,9 @@ def run_source(
 ) -> RunSummary:
     """采集一个源。
 
-    列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
+    列表页请求/解析失败会终止该源本轮并把错误记录到
+    ``RunSummary.fatal_error`` 后重新抛出，由调用方决定是否继续其他源；
+    单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
     """
 
@@ -71,31 +74,36 @@ def run_source(
     processed = 0
 
     try:
-        for page in adapter.iter_list_pages():
-            for item in page.items:
-                if item.external_id in seen:
-                    summary.skipped += 1
-                    log_item(log, source.name, item.external_id, "skipped", 0)
-                    continue
-                seen.add(item.external_id)
-                if limit is not None and processed >= limit:
-                    summary.skipped += 1
-                    log_item(log, source.name, item.external_id, "skipped", 0)
-                    continue
-                processed += 1
-                outcome = process_item(
-                    adapter,
-                    item,
-                    db=db,
-                    raw_store=raw_store,
-                    dry_run=dry_run,
-                    logger=log,
-                )
-                summary.results.append(outcome)
-                if outcome.status == "ok":
-                    summary.ok += 1
-                else:
-                    summary.failed += 1
+        try:
+            for page in adapter.iter_list_pages():
+                for item in page.items:
+                    if item.external_id in seen:
+                        summary.skipped += 1
+                        log_item(log, source.name, item.external_id, "skipped", 0)
+                        continue
+                    seen.add(item.external_id)
+                    if limit is not None and processed >= limit:
+                        summary.skipped += 1
+                        log_item(log, source.name, item.external_id, "skipped", 0)
+                        continue
+                    processed += 1
+                    outcome = process_item(
+                        adapter,
+                        item,
+                        db=db,
+                        raw_store=raw_store,
+                        dry_run=dry_run,
+                        logger=log,
+                    )
+                    summary.results.append(outcome)
+                    if outcome.status == "ok":
+                        summary.ok += 1
+                    else:
+                        summary.failed += 1
+        except (FetchError, ParseError) as exc:
+            # 整轮失败：保留已完成条目的汇总，错误向上抛交给调用方隔离。
+            summary.fatal_error = str(exc)
+            raise
     finally:
         if owns_fetcher:
             active_fetcher.close()

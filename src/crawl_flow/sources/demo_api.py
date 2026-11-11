@@ -40,6 +40,16 @@ class DemoApiAdapter(SourceAdapter):
             parsed.append(ListItem(external_id=external_id, url=self.detail_url(external_id)))
         return parsed
 
+    def list_response_page(self, result: FetchResult) -> int | None:
+        payload = self._list_payload(result)
+        raw_page = payload.get("page")
+        return raw_page if isinstance(raw_page, int) else None
+
+    def list_total_items(self, result: FetchResult) -> int | None:
+        payload = self._list_payload(result)
+        raw_total = payload.get("total")
+        return raw_total if isinstance(raw_total, int) and raw_total >= 0 else None
+
     def parse_detail(self, result: FetchResult, external_id: str) -> dict[str, Any]:
         payload = self._load_json(result, external_id)
         if not isinstance(payload, dict):
@@ -54,6 +64,12 @@ class DemoApiAdapter(SourceAdapter):
         if not isinstance(title, str) or not title.strip():
             raise self._parse_error(external_id, "详情缺少 title")
         return payload
+
+    def _list_payload(self, result: FetchResult) -> dict[str, Any]:
+        """读取列表响应 JSON 对象；结构问题交给 :meth:`parse_list` 报错。"""
+
+        payload = self._load_json(result, "list")
+        return payload if isinstance(payload, dict) else {}
 
     def _load_json(self, result: FetchResult, external_id: str) -> Any:
         try:

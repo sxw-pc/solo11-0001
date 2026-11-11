@@ -9,7 +9,7 @@ from typing import Optional
 import typer
 
 from crawl_flow.config import load_sources, select_sources
-from crawl_flow.errors import ConfigError, FetchError, StoreError
+from crawl_flow.errors import ConfigError, FetchError, ParseError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
 from crawl_flow.pipeline.run import RunSummary, run_source
@@ -53,24 +53,40 @@ def run_command(
     db = Database(db_path)
     raw_store = RawStore(raw_dir)
     summaries: list[RunSummary] = []
+    fatal_errors: list[str] = []
     try:
         db.init()
         with Fetcher() as fetcher:
             for selected_source in selected:
-                summaries.append(
-                    run_source(
-                        selected_source,
-                        db,
-                        raw_store,
-                        fetcher=fetcher,
-                        limit=limit,
-                        dry_run=dry_run,
-                        logger=logger,
+                # 单个源翻页 / 解析 / 存储失败只终止该源，不影响其他源。
+                try:
+                    summaries.append(
+                        run_source(
+                            selected_source,
+                            db,
+                            raw_store,
+                            fetcher=fetcher,
+                            limit=limit,
+                            dry_run=dry_run,
+                            logger=logger,
+                        )
                     )
-                )
-    except FetchError as exc:
-        typer.secho(f"采集失败（整轮中止）: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+                except FetchError as exc:
+                    message = f"source={selected_source.name} {exc}"
+                    fatal_errors.append(message)
+                    typer.secho(
+                        f"采集失败（该源整轮中止）: {exc}",
+                        fg=typer.colors.RED,
+                        err=True,
+                    )
+                except ParseError as exc:
+                    message = f"source={selected_source.name} {exc}"
+                    fatal_errors.append(message)
+                    typer.secho(
+                        f"解析失败（该源整轮中止）: {exc}",
+                        fg=typer.colors.RED,
+                        err=True,
+                    )
     except StoreError as exc:
         typer.secho(f"存储失败: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -78,6 +94,13 @@ def run_command(
         db.close()
 
     _print_summaries(summaries, dry_run=dry_run)
+    if fatal_errors:
+        typer.secho(
+            f"{len(fatal_errors)} 个源整轮失败: " + "；".join(fatal_errors),
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
 
 @db_app.command("stats")

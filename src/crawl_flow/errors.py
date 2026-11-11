@@ -24,6 +24,14 @@ class FetchError(CrawlFlowError):
         self.status_code = status_code
 
 
+class PaginationError(FetchError):
+    """翻页状态机检测到的抓取错误：响应页码不一致、连续重复页等。
+
+    继承 :class:`FetchError`，因此与列表页 4xx/5xx 一样按「整轮失败」处理，
+    但属于本地状态机判定，不携带 HTTP 状态码。
+    """
+
+
 class ParseError(CrawlFlowError):
     """响应内容不符合适配器预期。"""
 

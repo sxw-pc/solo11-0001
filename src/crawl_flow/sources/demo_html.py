@@ -50,6 +50,34 @@ class DemoHtmlAdapter(SourceAdapter):
             )
         return items
 
+    def list_response_page(self, result: FetchResult) -> int | None:
+        """读取 ``table.items`` 上的 ``data-page`` 自报页码；缺失则不校验。"""
+
+        soup = self._soup(result)
+        table = soup.select_one("table.items")
+        if table is None:
+            return None
+        raw_page = table.get("data-page")
+        if raw_page is None:
+            return None
+        try:
+            return int(str(raw_page).strip())
+        except ValueError:
+            raise self._parse_error("list", f"列表 data-page 不是整数: {raw_page}")
+
+    def list_has_next(self, result: FetchResult) -> bool | None:
+        """HTML 列表通过「下一页」链接声明翻页：没有链接即末页。
+
+        表格缺失等结构问题留给 :meth:`parse_list` 抛 :class:`ParseError`，
+        此处只在能解析出表格时给出下一页信号。
+        """
+
+        soup = self._soup(result)
+        if soup.select_one("table.items") is None:
+            return None
+        next_link = soup.select_one("a[href*='page=']")
+        return next_link is not None
+
     def parse_detail(self, result: FetchResult, external_id: str) -> dict[str, Any]:
         soup = self._soup(result)
         title_el = soup.select_one("h1.title")

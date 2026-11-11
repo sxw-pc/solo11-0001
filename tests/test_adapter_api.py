@@ -18,8 +18,9 @@ def adapter(api_source: SourceConfig, fetcher: Fetcher) -> DemoApiAdapter:
 
 def test_iter_list_pages_collects_all_items(adapter: DemoApiAdapter) -> None:
     pages = list(adapter.iter_list_pages())
-    assert [page.page for page in pages] == [1, 2, 3, 4]
-    assert [len(page.items) for page in pages] == [5, 5, 5, 0]
+    # 总数 15、每页 5 恰好整除：取满 3 页即终止，不再多请求第 4 页空页。
+    assert [page.page for page in pages] == [1, 2, 3]
+    assert [len(page.items) for page in pages] == [5, 5, 5]
 
     ids = [item.external_id for page in pages for item in page.items]
     assert len(ids) == 15

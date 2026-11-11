@@ -6,16 +6,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from crawl_flow.cli import app
+from crawl_flow.errors import PaginationError
 from crawl_flow.models import RawRecordRow
 from crawl_flow.pipeline.run import run_source
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
-
 
 def test_detail_500_does_not_abort_round(
     db: Database,
@@ -85,3 +86,66 @@ def test_cli_returns_zero_when_details_fail(
         assert database.count_records() == 0
     finally:
         database.close()
+
+
+def test_one_source_pagination_failure_does_not_block_others(
+    write_config: Any,
+    source_payload: Any,
+    tmp_path: Path,
+) -> None:
+    """一个源翻页失败（错页）时，其他源仍正常采集；CLI 退出码 2。"""
+
+    config_path = write_config(
+        [
+            source_payload(
+                "demo_api_badpage",
+                list_path="/api/items?badpage=1",
+            ),
+            source_payload("demo_html", "html"),
+        ]
+    )
+    db_path = tmp_path / "isolation.db"
+    raw_dir = tmp_path / "isolation-raw"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "--all",
+            "--limit",
+            "1",
+            "--config",
+            str(config_path),
+            "--db",
+            str(db_path),
+            "--raw-dir",
+            str(raw_dir),
+        ],
+    )
+
+    # 失败源导致退出码 2，但健康源的结果必须保留。
+    assert result.exit_code == 2, result.output
+    assert "demo_api_badpage" in result.output
+    assert "source=demo_html ok=1" in result.output
+    assert "整轮中止" in result.output
+
+    database = Database(db_path)
+    database.init()
+    try:
+        assert database.count_records("demo_html") == 1
+        assert database.count_records("demo_api_badpage") == 0
+    finally:
+        database.close()
+
+
+def test_run_source_records_fatal_error_on_pagination_failure(
+    db: Database,
+    raw_store: RawStore,
+    make_source: Any,
+    fetcher: Any,
+) -> None:
+    """run_source 翻页失败时向上抛错，且 fatal_error 记录原因。"""
+
+    broken = make_source("demo_api_badpage", list_path="/api/items?badpage=1")
+    with pytest.raises(PaginationError):
+        run_source(broken, db, raw_store, fetcher=fetcher)

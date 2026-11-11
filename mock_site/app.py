@@ -1,7 +1,9 @@
 """本地 mock 站点：提供 demo_api / demo_html 所需的 HTTP 接口。
 
 默认只监听本地，不访问公网。支持 ``?fail=1``（详情 500，列表 503）、
-``?empty=1``（空页）与任意 ``page`` / ``page_size`` 参数。
+``?empty=1``（空页）、``?badpage=1``（响应页码与请求页码不一致）、
+``?dup=1``（每页都返回第 1 页内容，模拟连续重复页）与任意
+``page`` / ``page_size`` 参数。
 """
 
 from __future__ import annotations
@@ -65,12 +67,15 @@ def create_app(fixtures_dir: str | Path | None = None) -> Flask:
         page_size = _positive_int("page_size", 5, maximum=100)
         page_items: list[dict[str, Any]] = []
         if not _flag("empty") and page >= 1:
-            start = (page - 1) * page_size
+            effective_page = 1 if _flag("dup") else page
+            start = (effective_page - 1) * page_size
             page_items = api_items[start : start + page_size]
+        # badpage：自报页码与请求页码错位，用于验证页码一致性校验。
+        reported_page = page + 1 if _flag("badpage") else page
         return jsonify(
             {
                 "total": len(api_items),
-                "page": page,
+                "page": reported_page,
                 "page_size": page_size,
                 "items": page_items,
             }
@@ -92,10 +97,26 @@ def create_app(fixtures_dir: str | Path | None = None) -> Flask:
         if _flag("empty"):
             return Response(EMPTY_LIST_HTML, content_type=HTML_CONTENT_TYPE)
         page = _positive_int("page", 1)
-        path = fixtures / "html" / f"list_{page}.html"
+        # dup：任意页码都返回第 1 页内容，模拟站点翻页失效 / 连续重复页。
+        effective_page = 1 if _flag("dup") else page
+        path = fixtures / "html" / f"list_{effective_page}.html"
         if not path.is_file():
             return Response(EMPTY_LIST_HTML, content_type=HTML_CONTENT_TYPE)
-        return Response(path.read_text(encoding="utf-8"), content_type=HTML_CONTENT_TYPE)
+        body = path.read_text(encoding="utf-8")
+        if _flag("dup"):
+            # 内容重复但页码自报与请求一致，使测试命中「连续重复页」而非
+            # 「页码不一致」分支。
+            body = body.replace(
+                f'data-page="{effective_page}"',
+                f'data-page="{page}"',
+            )
+        elif _flag("badpage"):
+            # badpage：表格自报页码与请求页码错位，用于验证页码一致性校验。
+            body = body.replace(
+                f'data-page="{effective_page}"',
+                f'data-page="{page + 1}"',
+            )
+        return Response(body, content_type=HTML_CONTENT_TYPE)
 
     @app.get("/item/<item_id>")
     def html_detail(item_id: str) -> Response | tuple[str, int]:

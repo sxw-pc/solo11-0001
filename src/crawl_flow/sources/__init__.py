@@ -8,6 +8,10 @@ from crawl_flow.fetch.client import Fetcher
 from crawl_flow.sources.base import ListItem, ListPage, SourceAdapter
 from crawl_flow.sources.demo_api import DemoApiAdapter
 from crawl_flow.sources.demo_html import DemoHtmlAdapter
+from crawl_flow.sources.pagination import (
+    PaginationState,
+    PaginationStateMachine,
+)
 
 ADAPTERS: dict[str, type[SourceAdapter]] = {
     "api": DemoApiAdapter,
@@ -28,6 +32,8 @@ __all__ = [
     "ADAPTERS",
     "ListItem",
     "ListPage",
+    "PaginationState",
+    "PaginationStateMachine",
     "SourceAdapter",
     "create_adapter",
 ]
