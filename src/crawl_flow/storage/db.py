@@ -1,4 +1,4 @@
-"""SQLite 持久化：建表、幂等 upsert、统计查询。"""
+"""SQLite 持久化：建表、幂等 upsert、统计查询、采集运行记录。"""
 
 from __future__ import annotations
 
@@ -6,13 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
-from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+from crawl_flow.models import Base, JobRun, JobRunRow, RawRecord, RawRecordRow, Record, RecordRow
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -26,6 +26,9 @@ RECORD_UPDATE_FIELDS = (
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+
+# 每个源最多保留的运行历史条数，防止 job_runs 无限增长。
+JOB_RUNS_KEEP_PER_SOURCE = 1000
 
 
 def _utcnow() -> datetime:
@@ -43,7 +46,7 @@ class Database:
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def init(self) -> None:
-        """创建两张表及索引（幂等）。"""
+        """创建全部表及索引（幂等）。"""
 
         try:
             Base.metadata.create_all(self.engine)
@@ -178,6 +181,149 @@ class Database:
         }
         return {"sources": rows, "totals": totals}
 
+    def insert_job_run(self, run: JobRun, *, keep_per_source: int = JOB_RUNS_KEEP_PER_SOURCE) -> None:
+        """追加一条运行记录，并裁剪该源超出保留上限的旧记录。"""
+
+        values = {
+            "source": run.source,
+            "trigger": run.trigger,
+            "status": run.status,
+            "ok_count": run.ok_count,
+            "failed_count": run.failed_count,
+            "skipped_count": run.skipped_count,
+            "elapsed_ms": run.elapsed_ms,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "error": run.error,
+        }
+        try:
+            with self._session_factory() as session:
+                session.execute(sqlite_insert(JobRunRow).values(**values))
+                if keep_per_source > 0:
+                    ranked = (
+                        select(
+                            JobRunRow.id,
+                            func.row_number()
+                            .over(partition_by=JobRunRow.source, order_by=JobRunRow.id.desc())
+                            .label("rn"),
+                        )
+                        .subquery()
+                    )
+                    session.execute(
+                        delete(JobRunRow).where(
+                            JobRunRow.id.in_(
+                                select(ranked.c.id).where(ranked.c.rn > keep_per_source)
+                            )
+                        )
+                    )
+                session.commit()
+        except SQLAlchemyError as exc:
+            raise StoreError(f"job_runs 写入失败 source={run.source} error={exc}") from exc
+
+    def recent_job_runs(self, *, source: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """按开始时间倒序返回最近的运行记录。"""
+
+        statement = select(JobRunRow).order_by(JobRunRow.id.desc()).limit(limit)
+        if source is not None:
+            statement = statement.where(JobRunRow.source == source)
+        with Session(self.engine) as session:
+            rows = session.execute(statement).scalars().all()
+        return [
+            {
+                "id": row.id,
+                "source": row.source,
+                "trigger": row.trigger,
+                "status": row.status,
+                "ok_count": row.ok_count,
+                "failed_count": row.failed_count,
+                "skipped_count": row.skipped_count,
+                "elapsed_ms": row.elapsed_ms,
+                "started_at": row.started_at,
+                "finished_at": row.finished_at,
+                "error": row.error,
+            }
+            for row in rows
+        ]
+
+    def job_run_aggregates(self) -> dict[str, Any]:
+        """汇总运行记录，供指标渲染与 history 展示使用。"""
+
+        with Session(self.engine) as session:
+            run_rows = session.execute(
+                select(
+                    JobRunRow.source,
+                    JobRunRow.trigger,
+                    JobRunRow.status,
+                    func.count(),
+                ).group_by(JobRunRow.source, JobRunRow.trigger, JobRunRow.status)
+            ).all()
+            item_rows = session.execute(
+                select(
+                    JobRunRow.source,
+                    func.coalesce(func.sum(JobRunRow.ok_count), 0),
+                    func.coalesce(func.sum(JobRunRow.failed_count), 0),
+                    func.coalesce(func.sum(JobRunRow.skipped_count), 0),
+                ).group_by(JobRunRow.source)
+            ).all()
+            duration_rows = session.execute(
+                select(
+                    JobRunRow.source,
+                    func.avg(JobRunRow.elapsed_ms),
+                    func.count(),
+                )
+                .where(JobRunRow.status != "skipped")
+                .group_by(JobRunRow.source)
+            ).all()
+            latest_ids = (
+                select(JobRunRow.source, func.max(JobRunRow.id).label("max_id"))
+                .group_by(JobRunRow.source)
+                .subquery()
+            )
+            last_rows = session.execute(
+                select(JobRunRow).where(JobRunRow.id.in_(select(latest_ids.c.max_id)))
+            ).scalars().all()
+            executed_ids = (
+                select(JobRunRow.source, func.max(JobRunRow.id).label("max_id"))
+                .where(JobRunRow.status != "skipped")
+                .group_by(JobRunRow.source)
+                .subquery()
+            )
+            last_executed_rows = session.execute(
+                select(JobRunRow).where(JobRunRow.id.in_(select(executed_ids.c.max_id)))
+            ).scalars().all()
+
+        def _row_dict(row: JobRunRow) -> dict[str, Any]:
+            return {
+                "source": row.source,
+                "status": row.status,
+                "trigger": row.trigger,
+                "started_at": row.started_at,
+                "finished_at": row.finished_at,
+                "elapsed_ms": row.elapsed_ms,
+            }
+
+        return {
+            "runs": [
+                {"source": source, "trigger": trigger, "status": status, "count": int(count)}
+                for source, trigger, status, count in run_rows
+            ],
+            "items": [
+                {
+                    "source": source,
+                    "ok": int(ok),
+                    "failed": int(failed),
+                    "skipped": int(skipped),
+                }
+                for source, ok, failed, skipped in item_rows
+            ],
+            "durations": [
+                {"source": source, "avg_ms": float(avg_ms), "runs": int(runs)}
+                for source, avg_ms, runs in duration_rows
+            ],
+            "last": [_row_dict(row) for row in last_rows],
+            "last_executed": [_row_dict(row) for row in last_executed_rows],
+        }
+
     def close(self) -> None:
         self.engine.dispose()
 
@@ -187,4 +333,8 @@ def _create_engine(path: Path) -> Engine:
 
     if str(path) == ":memory:":
         return create_engine("sqlite://", future=True)
-    return create_engine(f"sqlite:///{path}", future=True)
+    # busy timeout：调度线程与手动 CLI 进程可能同时写同一个库文件，
+    # 遇到写锁时最多等待 15 秒而不是立即报 "database is locked"。
+    return create_engine(
+        f"sqlite:///{path}", future=True, connect_args={"timeout": 15}
+    )

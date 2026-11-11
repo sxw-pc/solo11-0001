@@ -18,6 +18,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 RawStatus = Literal["ok", "failed"]
+JobRunTrigger = Literal["manual", "scheduled"]
+JobRunStatus = Literal["succeeded", "failed", "skipped"]
 
 
 class Record(BaseModel):
@@ -57,6 +59,27 @@ class RawRecord(BaseModel):
             return None
         trimmed = value.strip()
         return trimmed or None
+
+
+class JobRun(BaseModel):
+    """一轮采集执行的记录，对应 ``job_runs`` 表。
+
+    ``status`` 取值：``succeeded`` 整轮执行完成（允许存在单条失败）、
+    ``failed`` 整轮失败（列表页错误等）、``skipped`` 调度时上一次未结束被跳过。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(min_length=1)
+    trigger: JobRunTrigger
+    status: JobRunStatus
+    ok_count: int = Field(default=0, ge=0)
+    failed_count: int = Field(default=0, ge=0)
+    skipped_count: int = Field(default=0, ge=0)
+    elapsed_ms: int = Field(default=0, ge=0)
+    started_at: datetime
+    finished_at: datetime
+    error: str | None = None
 
 
 class Base(DeclarativeBase):
@@ -103,3 +126,24 @@ class RecordRow(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class JobRunRow(Base):
+    """``job_runs``：每轮采集执行的只追加历史，手动与定时触发共用。"""
+
+    __tablename__ = "job_runs"
+    __table_args__ = (
+        Index("ix_job_runs_source_started", "source", "started_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    ok_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    finished_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)

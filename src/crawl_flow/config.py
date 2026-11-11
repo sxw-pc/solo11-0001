@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -9,6 +10,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from crawl_flow.errors import ConfigError
+from crawl_flow.scheduler.cron import CronError, CronSchedule
 
 SourceType = Literal["api", "html"]
 
@@ -44,6 +46,7 @@ class SourceConfig(BaseModel):
     timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     list_path: str | None = None
     detail_path: str | None = None
+    schedule: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
 
     @field_validator("base_url")
@@ -52,6 +55,22 @@ class SourceConfig(BaseModel):
         if not value.startswith(("http://", "https://")):
             raise ValueError("base_url 必须以 http:// 或 https:// 开头")
         return value.rstrip("/")
+
+    @field_validator("schedule")
+    @classmethod
+    def _check_schedule(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            raise ValueError("schedule 不能为空字符串")
+        try:
+            cron = CronSchedule(text)
+        except CronError as exc:
+            raise ValueError(f"schedule 不是合法的 cron 表达式: {exc}") from exc
+        if cron.next_after(datetime.now()) is None:
+            raise ValueError(f"schedule 在未来 8 年内没有触发时间: {text}")
+        return text
 
     @model_validator(mode="after")
     def _fill_paths(self) -> "SourceConfig":

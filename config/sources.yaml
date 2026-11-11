@@ -1,5 +1,7 @@
 # crawl-flow 源配置
 # 每个源必须包含 name / type / base_url；page_size 只对 api 类型生效。
+# schedule 为可选的标准 5 段 cron 表达式（分 时 日 月 周，本地时间），
+# 配置后 `crawl-flow schedule start` 会到点自动采集该源；不写则只能手动触发。
 sources:
   - name: demo_api
     type: api
@@ -7,6 +9,7 @@ sources:
     enabled: true
     page_size: 5
     timeout_seconds: 10
+    schedule: "*/5 * * * *"   # 每 5 分钟采集一次
     # 默认路径分别是 /api/items 与 /api/items/{id}，这里显式写出便于阅读
     list_path: /api/items
     detail_path: /api/items/{id}
@@ -24,6 +27,7 @@ sources:
     enabled: true
     page_size: 5
     timeout_seconds: 10
+    # schedule: "0 * * * *"   # 示例：每小时整点采集一次
     list_path: /list
     detail_path: /item/{id}
     field_map:
