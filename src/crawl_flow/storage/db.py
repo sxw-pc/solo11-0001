@@ -25,7 +25,15 @@ RECORD_UPDATE_FIELDS = (
     "updated_at",
 )
 
-RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+RAW_UPDATE_FIELDS = (
+    "url",
+    "http_status",
+    "fetched_at",
+    "status",
+    "error",
+    "raw_path",
+    "proxy_used",
+)
 
 
 def _utcnow() -> datetime:
@@ -93,6 +101,7 @@ class Database:
             "status": raw.status,
             "error": raw.error,
             "raw_path": raw.raw_path,
+            "proxy_used": raw.proxy_used,
         }
         try:
             with self._session_factory() as session:

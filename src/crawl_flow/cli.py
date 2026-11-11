@@ -10,7 +10,6 @@ import typer
 
 from crawl_flow.config import load_sources, select_sources
 from crawl_flow.errors import ConfigError, FetchError, StoreError
-from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
 from crawl_flow.pipeline.run import RunSummary, run_source
 from crawl_flow.storage.db import Database
@@ -55,19 +54,19 @@ def run_command(
     summaries: list[RunSummary] = []
     try:
         db.init()
-        with Fetcher() as fetcher:
-            for selected_source in selected:
-                summaries.append(
-                    run_source(
-                        selected_source,
-                        db,
-                        raw_store,
-                        fetcher=fetcher,
-                        limit=limit,
-                        dry_run=dry_run,
-                        logger=logger,
-                    )
+        # 不传共享 Fetcher：run_source 会按每个源的 proxies 配置构建
+        # 独立的直连/代理池客户端，并在该源处理结束后自行关闭。
+        for selected_source in selected:
+            summaries.append(
+                run_source(
+                    selected_source,
+                    db,
+                    raw_store,
+                    limit=limit,
+                    dry_run=dry_run,
+                    logger=logger,
                 )
+            )
     except FetchError as exc:
         typer.secho(f"采集失败（整轮中止）: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc

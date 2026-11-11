@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -17,6 +18,8 @@ DEFAULT_PATHS: dict[str, tuple[str, str]] = {
     "html": ("/list", "/item/{id}"),
 }
 
+SUPPORTED_PROXY_SCHEMES = ("http", "https", "socks5")
+
 
 class FieldMapping(BaseModel):
     """源字段 → 标准字段的映射。值写源数据里的键名。"""
@@ -29,6 +32,44 @@ class FieldMapping(BaseModel):
     published_at: str = "published_at"
     content: str = "content"
     url: str | None = None
+
+
+class ProxyConfig(BaseModel):
+    """单个源的代理池配置。
+
+    - ``urls``：代理地址列表，协议仅支持 http/https/socks5，至少一个、不可重复；
+    - ``failure_threshold``：同一代理连续失败达到该次数后进入冷却；
+    - ``cooldown_seconds``：冷却时长，到期后代理自动恢复可用。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    urls: list[str] = Field(min_length=1)
+    failure_threshold: int = Field(default=3, ge=1, le=100)
+    cooldown_seconds: float = Field(default=60.0, gt=0, le=86400)
+
+    @field_validator("urls")
+    @classmethod
+    def _check_urls(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for index, raw in enumerate(value):
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError(f"proxies.urls[{index}] 不能为空")
+            address = raw.strip()
+            parsed = urlparse(address)
+            if parsed.scheme not in SUPPORTED_PROXY_SCHEMES:
+                raise ValueError(
+                    f"proxies.urls[{index}] 协议必须是 "
+                    f"{'/'.join(SUPPORTED_PROXY_SCHEMES)} 之一: {address}"
+                )
+            if not parsed.hostname or not parsed.port:
+                raise ValueError(
+                    f"proxies.urls[{index}] 必须包含主机名与端口: {address}"
+                )
+            normalized.append(address)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("proxies.urls 中存在重复代理地址")
+        return normalized
 
 
 class SourceConfig(BaseModel):
@@ -45,6 +86,7 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    proxies: ProxyConfig | None = None
 
     @field_validator("base_url")
     @classmethod

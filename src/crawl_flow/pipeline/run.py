@@ -11,6 +11,7 @@ from typing import Any
 from crawl_flow.config import SourceConfig
 from crawl_flow.errors import FetchError, ParseError
 from crawl_flow.fetch.client import Fetcher
+from crawl_flow.fetch.proxy_pool import ProxyPool
 from crawl_flow.fetch.types import FetchResult
 from crawl_flow.models import RawRecord
 from crawl_flow.observability.logging import log_item
@@ -45,6 +46,19 @@ class RunSummary:
     results: list[ItemOutcome] = field(default_factory=list)
 
 
+def _build_fetcher(source: SourceConfig) -> Fetcher:
+    """按源配置构建 Fetcher；未配置代理时与历史直连行为完全一致。"""
+
+    if source.proxies is None:
+        return Fetcher(timeout=source.timeout_seconds)
+    pool = ProxyPool(
+        source.proxies.urls,
+        failure_threshold=source.proxies.failure_threshold,
+        cooldown_seconds=source.proxies.cooldown_seconds,
+    )
+    return Fetcher(timeout=source.timeout_seconds, proxy_pool=pool)
+
+
 def run_source(
     source: SourceConfig,
     db: Database,
@@ -63,7 +77,7 @@ def run_source(
 
     log = logger or logging.getLogger(LOGGER_NAME)
     owns_fetcher = fetcher is None
-    active_fetcher = fetcher or Fetcher(timeout=source.timeout_seconds)
+    active_fetcher = fetcher or _build_fetcher(source)
     adapter = create_adapter(source, active_fetcher)
     summary = RunSummary(source=source.name)
     started = time.perf_counter()
@@ -142,6 +156,8 @@ def process_item(
             error=str(exc),
             elapsed_ms=elapsed_ms,
             fetched_at=fetched_at,
+            http_status=exc.status_code,
+            proxy_used=exc.proxy_used,
         )
 
     if result.status_code >= 400:
@@ -157,6 +173,7 @@ def process_item(
             elapsed_ms=elapsed_ms,
             fetched_at=fetched_at,
             result=result,
+            proxy_used=result.proxy_used,
         )
 
     try:
@@ -181,6 +198,7 @@ def process_item(
             elapsed_ms=elapsed_ms,
             fetched_at=fetched_at,
             result=result,
+            proxy_used=result.proxy_used,
         )
 
     if not dry_run:
@@ -200,6 +218,7 @@ def process_item(
                 status="ok",
                 error=None,
                 raw_path=raw_path,
+                proxy_used=result.proxy_used,
             )
         )
         db.upsert_record(record)
@@ -221,10 +240,24 @@ def _fail(
     elapsed_ms: int,
     fetched_at: datetime,
     result: FetchResult | None = None,
+    http_status: int | None = None,
+    proxy_used: str | None = None,
 ) -> ItemOutcome:
     summary = error.strip().replace("\n", " ")[:MAX_ERROR_LENGTH]
+    effective_proxy = proxy_used or (result.proxy_used if result is not None else None)
+    effective_status = (
+        result.status_code if result is not None else http_status
+    )
     if not dry_run:
-        payload = _failure_payload(source_name, item, fetched_at, summary, result)
+        payload = _failure_payload(
+            source_name,
+            item,
+            fetched_at,
+            summary,
+            result,
+            effective_proxy,
+            effective_status,
+        )
         raw_path = raw_store.save(
             source=source_name,
             external_id=item.external_id,
@@ -236,11 +269,12 @@ def _fail(
                 source=source_name,
                 external_id=item.external_id,
                 url=result.url if result is not None else item.url,
-                http_status=result.status_code if result is not None else None,
+                http_status=effective_status,
                 fetched_at=fetched_at,
                 status="failed",
                 error=summary,
                 raw_path=raw_path,
+                proxy_used=effective_proxy,
             )
         )
     log_item(logger, source_name, item.external_id, "failed", elapsed_ms)
@@ -272,6 +306,7 @@ def _success_payload(
         "fetched_at": fetched_at.isoformat(),
         "headers": result.headers,
         "body": result.body,
+        "proxy_used": result.proxy_used,
     }
 
 
@@ -281,14 +316,17 @@ def _failure_payload(
     fetched_at: datetime,
     error: str,
     result: FetchResult | None,
+    proxy_used: str | None,
+    http_status: int | None,
 ) -> dict[str, Any]:
     return {
         "source": source_name,
         "external_id": item.external_id,
         "url": result.url if result is not None else item.url,
-        "status": result.status_code if result is not None else None,
+        "status": result.status_code if result is not None else http_status,
         "fetched_at": fetched_at.isoformat(),
         "headers": result.headers if result is not None else {},
         "body": result.body if result is not None else "",
         "error": error,
+        "proxy_used": proxy_used,
     }

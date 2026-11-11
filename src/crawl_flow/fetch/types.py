@@ -14,6 +14,7 @@ class FetchResult:
     headers: dict[str, str] = field(default_factory=dict)
     body: str = ""
     elapsed_ms: int = 0
+    proxy_used: str | None = None
 
     @property
     def ok(self) -> bool:

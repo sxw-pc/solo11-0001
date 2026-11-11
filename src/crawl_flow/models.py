@@ -49,6 +49,7 @@ class RawRecord(BaseModel):
     status: RawStatus
     error: str | None = None
     raw_path: str | None = None
+    proxy_used: str | None = None
 
     @field_validator("error")
     @classmethod
@@ -81,6 +82,7 @@ class RawRecordRow(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    proxy_used: Mapped[str | None] = mapped_column(String(2048), nullable=True)
 
 
 class RecordRow(Base):

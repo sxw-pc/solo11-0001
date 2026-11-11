@@ -68,3 +68,30 @@ sources:
       published_at: published_at
       content: content
       url: null
+
+  # 代理池示例（默认 disabled）：为单个源配置代理列表、故障判定阈值与冷却时长。
+  # 协议支持 http / https / socks5；连接异常或收到 403、5xx 时自动切换下一个
+  # 可用代理重试，同一条详情最多尝试 3 个不同代理，全部失败才记为采集失败。
+  # 代理连续失败 failure_threshold 次后进入冷却，cooldown_seconds 到期自动恢复。
+  # - name: demo_api_proxied
+  #   type: api
+  #   base_url: http://127.0.0.1:8010
+  #   enabled: false
+  #   page_size: 5
+  #   timeout_seconds: 10
+  #   list_path: /api/items
+  #   detail_path: /api/items/{id}
+  #   proxies:
+  #     urls:
+  #       - http://127.0.0.1:8081
+  #       - https://127.0.0.1:8082
+  #       - socks5://127.0.0.1:1080
+  #     failure_threshold: 3
+  #     cooldown_seconds: 60
+  #   field_map:
+  #     title: title
+  #     category: category
+  #     tags: tags
+  #     published_at: published_at
+  #     content: content
+  #     url: null
