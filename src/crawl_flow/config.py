@@ -9,6 +9,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from crawl_flow.errors import ConfigError
+from crawl_flow.scheduler.cron import CronParseError, parse_cron
 
 SourceType = Literal["api", "html"]
 
@@ -16,6 +17,23 @@ DEFAULT_PATHS: dict[str, tuple[str, str]] = {
     "api": ("/api/items", "/api/items/{id}"),
     "html": ("/list", "/item/{id}"),
 }
+
+
+class ScheduleConfig(BaseModel):
+    """单个源的定时计划配置，目前只支持标准 5 段 cron 表达式。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cron: str = Field(min_length=1, description="标准 5 段 cron：分 时 日 月 周")
+
+    @field_validator("cron")
+    @classmethod
+    def _check_cron(cls, value: str) -> str:
+        try:
+            parse_cron(value)
+        except CronParseError as exc:
+            raise ValueError(f"cron 表达式非法: {exc}") from exc
+        return value
 
 
 class FieldMapping(BaseModel):
@@ -45,6 +63,8 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    # 可选定时计划；缺省表示该源只支持手动触发，不进入调度器
+    schedule: ScheduleConfig | None = None
 
     @field_validator("base_url")
     @classmethod

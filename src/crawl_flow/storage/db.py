@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, event, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -41,6 +41,17 @@ class Database:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.engine: Engine = _create_engine(self.path)
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
+
+    @property
+    def session_factory(self) -> sessionmaker:
+        """暴露 session 工厂，供指标注册表等复用同一引擎。"""
+
+        return self._session_factory
+
+    def session(self) -> Session:
+        """打开一个新 session（调用方负责 with 关闭）。"""
+
+        return self._session_factory()
 
     def init(self) -> None:
         """创建两张表及索引（幂等）。"""
@@ -187,4 +198,20 @@ def _create_engine(path: Path) -> Engine:
 
     if str(path) == ":memory:":
         return create_engine("sqlite://", future=True)
-    return create_engine(f"sqlite:///{path}", future=True)
+    # WAL 允许调度器长驻进程与手动 CLI 进程同时读写；busy_timeout 让锁
+    # 竞争时等待而不是立刻抛 database is locked。
+    engine = create_engine(
+        f"sqlite:///{path}",
+        future=True,
+        connect_args={"timeout": 5},
+    )
+
+    @event.listens_for(engine, "connect")
+    def _tune_sqlite(dbapi_connection: object, _record: object) -> None:
+        cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
+    return engine

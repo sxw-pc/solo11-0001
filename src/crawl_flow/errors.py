@@ -37,3 +37,7 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class SchedulerError(CrawlFlowError):
+    """定时调度或指标模块的配置 / 运行错误。"""
