@@ -21,7 +21,11 @@ RawStatus = Literal["ok", "failed"]
 
 
 class Record(BaseModel):
-    """归一化后的标准记录，对应 ``records`` 表。"""
+    """归一化后的标准记录，对应 ``records`` 表。
+
+    ``quality_score`` 为 ``None`` 表示本轮未启用规则引擎；
+    ``quality_flags`` 记录机器可读的违规标记（如 ``low_quality``）。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -34,6 +38,8 @@ class Record(BaseModel):
     content: str = ""
     url: str = ""
     fetched_at: datetime | None = None
+    quality_score: int | None = Field(default=None, ge=0, le=100)
+    quality_flags: list[str] = Field(default_factory=list)
 
 
 class RawRecord(BaseModel):
@@ -103,3 +109,5 @@ class RecordRow(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    quality_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quality_flags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)

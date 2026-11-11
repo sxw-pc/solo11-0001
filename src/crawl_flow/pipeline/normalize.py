@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 from bs4 import BeautifulSoup
 
 from crawl_flow.config import SourceConfig
 from crawl_flow.errors import ParseError
 from crawl_flow.models import Record
+
+if TYPE_CHECKING:
+    from crawl_flow.rules.engine import QualityReport, RuleEngine
 
 TAG_SEPARATOR = re.compile(r"[,，、|;；]+")
 SPACE_RUN = re.compile(r"[ \t\u3000\xa0]+")
@@ -141,31 +144,69 @@ def normalize_record(
     *,
     detail_url: str,
     fetched_at: datetime,
+    rule_engine: "RuleEngine | None" = None,
+    report: "QualityReport | None" = None,
 ) -> Record:
     """把适配器返回的源字段字典转成 :class:`Record`。
 
     ``field_map`` 决定每个标准字段从哪个源键取值；标题缺失视为解析失败。
+
+    处理顺序：field_map 提取 → 规则引擎清洗（可选）→ 默认清洗（始终执行，
+    即规则异常时的降级基线）→ 规则引擎校验与评分（可选）。启用规则引擎时，
+    质量分与标记会写回 ``record.quality_score`` / ``record.quality_flags``，
+    处置动作体现在 ``report.action``。
     """
 
     mapping = source.field_map
-    title = clean_text(fields.get(mapping.title))
+    extracted: dict[str, Any] = {
+        "title": fields.get(mapping.title),
+        "category": fields.get(mapping.category) if mapping.category else None,
+        "tags": fields.get(mapping.tags) if mapping.tags else None,
+        "published_at": fields.get(mapping.published_at) if mapping.published_at else None,
+        "content": fields.get(mapping.content) if mapping.content else None,
+        "url": fields.get(mapping.url) if mapping.url else None,
+    }
+
+    use_rules = rule_engine is not None and report is not None
+    if use_rules:
+        extracted = rule_engine.clean_fields(extracted, report)
+
+    title = clean_text(extracted["title"])
     if not title:
         raise ParseError(source.name, external_id, "标题为空")
 
-    category_value = clean_text(fields.get(mapping.category)) if mapping.category else ""
-    source_url = clean_text(fields.get(mapping.url)) if mapping.url else ""
+    category_value = clean_text(extracted["category"])
+    source_url = clean_text(extracted["url"])
     canonical_url = source_url or detail_url
 
-    return Record(
+    record = Record(
         source=source.name,
         external_id=external_id,
         title=title,
         category=category_value or None,
-        tags=split_tags(fields.get(mapping.tags)) if mapping.tags else [],
-        published_at=parse_datetime(fields.get(mapping.published_at))
+        tags=split_tags(extracted["tags"]) if mapping.tags else [],
+        published_at=parse_datetime(extracted["published_at"])
         if mapping.published_at
         else None,
-        content=html_to_text(fields.get(mapping.content)) if mapping.content else "",
+        content=html_to_text(extracted["content"]) if mapping.content else "",
         url=canonical_url,
         fetched_at=fetched_at,
     )
+
+    if use_rules:
+        rule_engine.validate_record(
+            {
+                "title": record.title,
+                "category": record.category,
+                "tags": record.tags,
+                "published_at": record.published_at,
+                "content": record.content,
+                "url": record.url,
+            },
+            report,
+        )
+        rule_engine.finalize(report)
+        record.quality_score = report.score
+        record.quality_flags = list(report.flags)
+
+    return record

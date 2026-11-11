@@ -1,0 +1,62 @@
+# crawl-flow 字段清洗与质量校验规则
+# 结构：全局阈值/失败处理 → defaults（所有源共用）→ sources（按源覆盖）。
+# 每条规则的公共字段：
+#   rule      算子名（必填）
+#   order     执行顺序，小的先跑（默认 100，相同 order 按书写顺序）
+#   severity  error（扣全部权重）| warning（扣一半），默认 error
+#   weight    计分权重，默认 1.0
+#   enabled   false 可临时关闭该条规则
+# 其余键为算子参数。可用算子见 docs/项目说明.md「规则引擎」一节。
+# 质量分 = 100 × (1 - 扣分权重 / 总权重)，低于 quality_threshold 触发 on_failure：
+#   skip=丢弃该条目 | mark=保留并打低质量标记 | alert=保留仅输出告警
+
+version: 1
+quality_threshold: 60
+on_failure: mark
+
+# 所有源共用的字段规则（源级同名字段会整体覆盖这里的配置）
+defaults:
+  fields:
+    title:
+      - rule: strip
+      - rule: truncate
+        max: 200
+        suffix: "…"
+      - rule: required
+    content:
+      - rule: html_strip
+    url:
+      - rule: pattern
+        regex: "^https?://"
+        severity: warning
+
+# 按来源独立配置
+sources:
+  demo_api:
+    quality_threshold: 70
+    on_failure: mark
+    fields:
+      category:
+        - rule: strip
+        - rule: enum
+          values: [环境, 技术, 文化, 交通, 教育, 经济]
+      published_at:
+        - rule: date_format
+          output: iso
+        - rule: date_parseable
+      tags:
+        - rule: strip
+        - rule: truncate
+          max: 20
+
+  demo_html:
+    quality_threshold: 60
+    on_failure: alert
+    fields:
+      category:
+        - rule: strip
+        - rule: enum
+          values: [环境, 技术, 文化, 交通, 教育, 经济]
+      published_at:
+        - rule: date_format
+          output: "%Y-%m-%d"

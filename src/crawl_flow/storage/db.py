@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, func, select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -23,9 +23,17 @@ RECORD_UPDATE_FIELDS = (
     "url",
     "fetched_at",
     "updated_at",
+    "quality_score",
+    "quality_flags",
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+
+# 规则引擎引入的 records 新列：(列名, DDL)。老库在 init() 时自动补齐。
+RECORD_QUALITY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("quality_score", "quality_score INTEGER"),
+    ("quality_flags", "quality_flags JSON"),
+)
 
 
 def _utcnow() -> datetime:
@@ -43,12 +51,24 @@ class Database:
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def init(self) -> None:
-        """创建两张表及索引（幂等）。"""
+        """创建两张表及索引（幂等），并为老库补齐质量评分列。"""
 
         try:
             Base.metadata.create_all(self.engine)
+            self._ensure_quality_columns()
         except SQLAlchemyError as exc:
             raise StoreError(f"建表失败 db={self.path} error={exc}") from exc
+
+    def _ensure_quality_columns(self) -> None:
+        """老版本数据库缺少 quality_* 列时用 ALTER TABLE 补齐（幂等）。"""
+
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA table_info(records)")).all()
+            existing = {row[1] for row in rows}
+            for column, ddl in RECORD_QUALITY_COLUMNS:
+                if column not in existing:
+                    conn.execute(text(f"ALTER TABLE records ADD COLUMN {ddl}"))
+            conn.commit()
 
     def upsert_record(self, record: Record) -> None:
         """按 (source, external_id) 幂等写入；重复采集只更新内容与时间戳。"""
@@ -65,6 +85,8 @@ class Database:
             "url": record.url,
             "fetched_at": fetched_at,
             "updated_at": _utcnow(),
+            "quality_score": record.quality_score,
+            "quality_flags": list(record.quality_flags),
         }
         try:
             with self._session_factory() as session:
