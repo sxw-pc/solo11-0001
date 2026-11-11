@@ -66,7 +66,8 @@ def test_records_store_normalized_fields(
     assert row.title == "开源数据库性能基准测试汇总"
     assert row.category == "技术"
     assert row.tags == ["数据库", "性能", "基线"]
-    assert row.published_at == datetime(2024, 3, 2, 9, 30)
+    # 2024-03-02T09:30:00+08:00 换算到 UTC 墙钟时间入库
+    assert row.published_at == datetime(2024, 3, 2, 1, 30)
     assert "三款开源数据库" in row.content
     assert row.url.endswith("/api/items/api-2")
     assert row.fetched_at is not None

@@ -32,6 +32,20 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def to_naive_utc(value: datetime) -> datetime:
+    """统一成 UTC 墙钟时间（naive）以适配 SQLite ``DateTime`` 列。
+
+    SQLAlchemy 的 naive ``DateTime`` 列会静默丢弃 ``tzinfo``，直接写入带偏移
+    的 datetime 会丢失时区换算、产生固定小时数的偏差。因此所有落盘时间都
+    先在此换算到 UTC 再去掉 ``tzinfo``；本身无时区的值按既定约定视为 UTC，
+    原样保留。
+    """
+
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 class Database:
     """单文件 SQLite 数据库封装，所有 SQLAlchemy 异常统一转 :class:`StoreError`。"""
 
@@ -60,11 +74,13 @@ class Database:
             "title": record.title,
             "category": record.category,
             "tags": list(record.tags),
-            "published_at": record.published_at,
+            "published_at": to_naive_utc(record.published_at)
+            if record.published_at is not None
+            else None,
             "content": record.content,
             "url": record.url,
-            "fetched_at": fetched_at,
-            "updated_at": _utcnow(),
+            "fetched_at": to_naive_utc(fetched_at),
+            "updated_at": to_naive_utc(_utcnow()),
         }
         try:
             with self._session_factory() as session:
@@ -89,7 +105,7 @@ class Database:
             "external_id": raw.external_id,
             "url": raw.url,
             "http_status": raw.http_status,
-            "fetched_at": raw.fetched_at,
+            "fetched_at": to_naive_utc(raw.fetched_at),
             "status": raw.status,
             "error": raw.error,
             "raw_path": raw.raw_path,
