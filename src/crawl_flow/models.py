@@ -18,6 +18,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 RawStatus = Literal["ok", "failed"]
+SyncKind = Literal["record", "raw"]
+SyncStatus = Literal["pending", "delivered"]
 
 
 class Record(BaseModel):
@@ -102,4 +104,37 @@ class RecordRow(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class SyncTaskRow(Base):
+    """``sync_tasks``：同步元数据独立表，与 records/raw_records 完全解耦。
+
+    记录每个 (target, kind, source, external_id) 的同步状态：重试次数耗尽后
+    以 ``status='pending'`` 落库等待后续重试，不会无限重试占用资源。
+    """
+
+    __tablename__ = "sync_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "target",
+            "kind",
+            "source",
+            "external_id",
+            name="uq_sync_tasks_target_kind_source_external",
+        ),
+        Index("ix_sync_tasks_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target: Mapped[str] = mapped_column(String(128), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from crawl_flow.errors import ConfigError
 
 SourceType = Literal["api", "html"]
+SyncTargetType = Literal["webhook", "file"]
 
 DEFAULT_PATHS: dict[str, tuple[str, str]] = {
     "api": ("/api/items", "/api/items/{id}"),
@@ -31,6 +32,44 @@ class FieldMapping(BaseModel):
     url: str | None = None
 
 
+class SyncTargetConfig(BaseModel):
+    """单个外部同步目标：采集完成后把记录/原始响应异步投递过去。
+
+    - ``webhook``：POST JSON 到 ``url``（覆盖连接失败/超时/4xx/5xx 等异常链路）
+    - ``file``：以 JSONL 追加到 ``path`` 目录（交接目录、共享挂载等场景）
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, pattern=r"^[A-Za-z0-9_-]+$")
+    type: SyncTargetType
+    enabled: bool = True
+    timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    url: str | None = None
+    path: str | None = None
+
+    @model_validator(mode="after")
+    def _check_type_fields(self) -> "SyncTargetConfig":
+        if self.type == "webhook":
+            if not self.url:
+                raise ValueError("webhook 类型的同步目标必须配置 url")
+            if not self.url.startswith(("http://", "https://")):
+                raise ValueError("webhook url 必须以 http:// 或 https:// 开头")
+        if self.type == "file" and not self.path:
+            raise ValueError("file 类型的同步目标必须配置 path")
+        return self
+
+
+class SyncSettings(BaseModel):
+    """全局同步策略（配置文件顶层可选的 ``sync:`` 段）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_workers: int = Field(default=2, ge=1, le=16)
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    backoff_seconds: float = Field(default=0.2, ge=0, le=30)
+
+
 class SourceConfig(BaseModel):
     """单个源的配置。"""
 
@@ -45,6 +84,7 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    sync_targets: list[SyncTargetConfig] = Field(default_factory=list)
 
     @field_validator("base_url")
     @classmethod
@@ -62,6 +102,10 @@ class SourceConfig(BaseModel):
             self.detail_path = detail_default
         if "{id}" not in self.detail_path:
             raise ValueError("detail_path 必须包含 {id} 占位符")
+        target_names = [target.name for target in self.sync_targets]
+        duplicates = sorted({name for name in target_names if target_names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"同步目标名称重复: {', '.join(duplicates)}")
         return self
 
 
@@ -96,6 +140,34 @@ def load_sources(path: str | Path) -> list[SourceConfig]:
     if duplicates:
         raise ConfigError(f"源名称重复: {', '.join(duplicates)}")
     return sources
+
+
+def load_sync_settings(path: str | Path) -> SyncSettings:
+    """读取配置文件顶层可选的 ``sync:`` 段；缺省时返回默认策略。
+
+    与 :func:`load_sources` 读取同一文件；文件不存在/解析失败同样抛
+    :class:`ConfigError`，``sync`` 段缺省或为空映射时使用默认值。
+    """
+
+    config_path = Path(path)
+    if not config_path.is_file():
+        raise ConfigError(f"配置文件不存在: {config_path}")
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"YAML 解析失败: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"配置文件读取失败: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ConfigError("配置顶层必须是包含 sources 列表的映射")
+    raw_sync = payload.get("sync")
+    if raw_sync is None:
+        return SyncSettings()
+    try:
+        return SyncSettings.model_validate(raw_sync)
+    except ValidationError as exc:
+        raise ConfigError(f"sync 段校验失败: {exc}") from exc
 
 
 def select_sources(

@@ -8,7 +8,7 @@ from typing import Optional
 
 import typer
 
-from crawl_flow.config import load_sources, select_sources
+from crawl_flow.config import load_sources, load_sync_settings, select_sources
 from crawl_flow.errors import ConfigError, FetchError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
@@ -46,6 +46,7 @@ def run_command(
     try:
         sources = load_sources(config)
         selected = select_sources(sources, name=source, all_sources=all_sources)
+        sync_settings = load_sync_settings(config)
     except ConfigError as exc:
         typer.secho(f"配置错误: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -66,6 +67,7 @@ def run_command(
                         limit=limit,
                         dry_run=dry_run,
                         logger=logger,
+                        sync_settings=sync_settings,
                     )
                 )
     except FetchError as exc:
@@ -144,10 +146,13 @@ def _print_summaries(summaries: list[RunSummary], *, dry_run: bool) -> None:
     mode = "（dry-run，未写 raw 与数据库）" if dry_run else ""
     typer.echo(f"本轮汇总{mode}")
     for summary in summaries:
-        typer.echo(
+        line = (
             f"source={summary.source} ok={summary.ok} failed={summary.failed} "
             f"skipped={summary.skipped} elapsed_ms={summary.elapsed_ms}"
         )
+        if summary.sync is not None:
+            line += f" sync_delivered={summary.sync['delivered']} sync_pending={summary.sync['pending']}"
+        typer.echo(line)
     if summaries:
         typer.echo(
             f"total ok={sum(s.ok for s in summaries)} "

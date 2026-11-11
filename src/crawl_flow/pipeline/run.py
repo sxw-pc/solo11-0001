@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from crawl_flow.config import SourceConfig
+from crawl_flow.config import SourceConfig, SyncSettings
 from crawl_flow.errors import FetchError, ParseError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
@@ -18,6 +18,7 @@ from crawl_flow.pipeline.normalize import normalize_record
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
+from crawl_flow.storage.sync import SyncManager, raw_payload, record_payload
 
 LOGGER_NAME = "crawl_flow.pipeline"
 MAX_ERROR_LENGTH = 500
@@ -43,6 +44,7 @@ class RunSummary:
     skipped: int = 0
     elapsed_ms: int = 0
     results: list[ItemOutcome] = field(default_factory=list)
+    sync: dict[str, int] | None = None
 
 
 def run_source(
@@ -54,11 +56,16 @@ def run_source(
     limit: int | None = None,
     dry_run: bool = False,
     logger: logging.Logger | None = None,
+    sync_settings: SyncSettings | None = None,
 ) -> RunSummary:
     """采集一个源。
 
     列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
+
+    配置了 ``sync_targets`` 的源：本地落库成功后把记录与原始响应投递到
+    :class:`SyncManager` 异步同步，本轮结束前等待同步收尾。同步层的任何
+    故障都不会影响本地采集；未配置同步目标的源执行流程完全不变。
     """
 
     log = logger or logging.getLogger(LOGGER_NAME)
@@ -69,6 +76,19 @@ def run_source(
     started = time.perf_counter()
     seen: set[str] = set()
     processed = 0
+
+    sync_manager: SyncManager | None = None
+    if source.sync_targets and not dry_run:
+        try:
+            sync_manager = SyncManager.from_source(
+                source.sync_targets,
+                db,
+                settings=sync_settings,
+                logger=log,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 同步初始化失败不阻断采集
+            log.warning("sync init failed source=%s error=%s", source.name, exc)
+            sync_manager = None
 
     try:
         for page in adapter.iter_list_pages():
@@ -90,6 +110,7 @@ def run_source(
                     raw_store=raw_store,
                     dry_run=dry_run,
                     logger=log,
+                    sync_manager=sync_manager,
                 )
                 summary.results.append(outcome)
                 if outcome.status == "ok":
@@ -99,6 +120,9 @@ def run_source(
     finally:
         if owns_fetcher:
             active_fetcher.close()
+        if sync_manager is not None:
+            sync_manager.close()
+            summary.sync = sync_manager.stats
 
     summary.elapsed_ms = int((time.perf_counter() - started) * 1000)
     log.info(
@@ -110,6 +134,13 @@ def run_source(
         summary.elapsed_ms,
         str(dry_run).lower(),
     )
+    if summary.sync is not None:
+        log.info(
+            "sync summary source=%s delivered=%d pending=%d",
+            summary.source,
+            summary.sync["delivered"],
+            summary.sync["pending"],
+        )
     return summary
 
 
@@ -121,6 +152,7 @@ def process_item(
     raw_store: RawStore,
     dry_run: bool,
     logger: logging.Logger,
+    sync_manager: SyncManager | None = None,
 ) -> ItemOutcome:
     """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。"""
 
@@ -142,6 +174,7 @@ def process_item(
             error=str(exc),
             elapsed_ms=elapsed_ms,
             fetched_at=fetched_at,
+            sync_manager=sync_manager,
         )
 
     if result.status_code >= 400:
@@ -157,6 +190,7 @@ def process_item(
             elapsed_ms=elapsed_ms,
             fetched_at=fetched_at,
             result=result,
+            sync_manager=sync_manager,
         )
 
     try:
@@ -181,28 +215,37 @@ def process_item(
             elapsed_ms=elapsed_ms,
             fetched_at=fetched_at,
             result=result,
+            sync_manager=sync_manager,
         )
 
     if not dry_run:
+        payload = _success_payload(source.name, item, result, fetched_at)
         raw_path = raw_store.save(
             source=source.name,
             external_id=item.external_id,
-            payload=_success_payload(source.name, item, result, fetched_at),
+            payload=payload,
             fetched_at=fetched_at,
         )
-        db.upsert_raw(
-            RawRecord(
-                source=source.name,
-                external_id=item.external_id,
-                url=result.url,
-                http_status=result.status_code,
-                fetched_at=fetched_at,
-                status="ok",
-                error=None,
-                raw_path=raw_path,
-            )
+        raw_record = RawRecord(
+            source=source.name,
+            external_id=item.external_id,
+            url=result.url,
+            http_status=result.status_code,
+            fetched_at=fetched_at,
+            status="ok",
+            error=None,
+            raw_path=raw_path,
         )
+        db.upsert_raw(raw_record)
         db.upsert_record(record)
+        if sync_manager is not None:
+            # 本地落库成功后异步同步；同步故障不影响本条结果。
+            sync_manager.submit(
+                "record", source.name, item.external_id, record_payload(record)
+            )
+            sync_manager.submit(
+                "raw", source.name, item.external_id, raw_payload(raw_record, payload)
+            )
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_item(logger, source.name, item.external_id, "ok", elapsed_ms)
@@ -221,6 +264,7 @@ def _fail(
     elapsed_ms: int,
     fetched_at: datetime,
     result: FetchResult | None = None,
+    sync_manager: SyncManager | None = None,
 ) -> ItemOutcome:
     summary = error.strip().replace("\n", " ")[:MAX_ERROR_LENGTH]
     if not dry_run:
@@ -231,18 +275,22 @@ def _fail(
             payload=payload,
             fetched_at=fetched_at,
         )
-        db.upsert_raw(
-            RawRecord(
-                source=source_name,
-                external_id=item.external_id,
-                url=result.url if result is not None else item.url,
-                http_status=result.status_code if result is not None else None,
-                fetched_at=fetched_at,
-                status="failed",
-                error=summary,
-                raw_path=raw_path,
-            )
+        raw_record = RawRecord(
+            source=source_name,
+            external_id=item.external_id,
+            url=result.url if result is not None else item.url,
+            http_status=result.status_code if result is not None else None,
+            fetched_at=fetched_at,
+            status="failed",
+            error=summary,
+            raw_path=raw_path,
         )
+        db.upsert_raw(raw_record)
+        if sync_manager is not None:
+            # 失败的原始响应与本地 raw_records 保持一致，同步给外部做监控。
+            sync_manager.submit(
+                "raw", source_name, item.external_id, raw_payload(raw_record, payload)
+            )
     log_item(logger, source_name, item.external_id, "failed", elapsed_ms)
     logger.warning(
         "item failed source=%s external_id=%s error=%s",

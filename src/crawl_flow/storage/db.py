@@ -12,7 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
-from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow, SyncTaskRow
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -26,6 +26,8 @@ RECORD_UPDATE_FIELDS = (
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+
+SYNC_UPDATE_FIELDS = ("payload", "status", "attempts", "max_attempts", "last_error", "updated_at")
 
 
 def _utcnow() -> datetime:
@@ -108,6 +110,61 @@ class Database:
                 f"raw_records 写入失败 source={raw.source} "
                 f"external_id={raw.external_id} error={exc}"
             ) from exc
+
+    def mark_sync_pending(
+        self,
+        *,
+        target: str,
+        kind: str,
+        source: str,
+        external_id: str,
+        payload: dict[str, Any],
+        attempts: int,
+        max_attempts: int,
+        last_error: str | None,
+    ) -> None:
+        """把重试耗尽的同步任务以 ``pending`` 状态落库（幂等 upsert）。
+
+        只写独立的 ``sync_tasks`` 表，不触碰 records/raw_records。
+        """
+
+        now = _utcnow()
+        values = {
+            "target": target,
+            "kind": kind,
+            "source": source,
+            "external_id": external_id,
+            "payload": payload,
+            "status": "pending",
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "last_error": last_error,
+            "created_at": now,
+            "updated_at": now,
+        }
+        try:
+            with self._session_factory() as session:
+                statement = sqlite_insert(SyncTaskRow).values(**values)
+                statement = statement.on_conflict_do_update(
+                    index_elements=["target", "kind", "source", "external_id"],
+                    set_={field: statement.excluded[field] for field in SYNC_UPDATE_FIELDS},
+                )
+                session.execute(statement)
+                session.commit()
+        except SQLAlchemyError as exc:
+            raise StoreError(
+                f"sync_tasks 写入失败 target={target} source={source} "
+                f"external_id={external_id} error={exc}"
+            ) from exc
+
+    def count_sync_tasks(self, status: str | None = None) -> int:
+        """统计同步任务行数，可按状态过滤；不影响 records/raw 的任何统计。"""
+
+        with Session(self.engine) as session:
+            statement = select(func.count()).select_from(SyncTaskRow)
+            if status is not None:
+                statement = statement.where(SyncTaskRow.status == status)
+            return int(session.execute(statement).scalar_one())
 
     def count_records(self, source: str | None = None) -> int:
         with Session(self.engine) as session:

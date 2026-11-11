@@ -1,5 +1,24 @@
 # crawl-flow 源配置
 # 每个源必须包含 name / type / base_url；page_size 只对 api 类型生效。
+#
+# 可选：在源内声明 sync_targets，采集完成后把结构化记录与原始响应异步同步到
+# 外部存储（本地优先，外部故障不影响采集；失败最多重试 max_attempts 次后落
+# sync_tasks 表待重试）。示例：
+#   sync_targets:
+#     - name: team_webhook
+#       type: webhook
+#       url: https://example.com/ingest
+#       timeout_seconds: 5
+#     - name: handoff_dir
+#       type: file
+#       path: data/sync_out
+#       enabled: false
+#
+# 顶层可选 sync 段控制全局同步策略（缺省用默认值）：
+# sync:
+#   max_workers: 2      # 同步并发上限
+#   max_attempts: 3     # 单任务最大尝试次数（含首次）
+#   backoff_seconds: 0.2
 sources:
   - name: demo_api
     type: api

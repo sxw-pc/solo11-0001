@@ -37,3 +37,10 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class SyncError(CrawlFlowError):
+    """外部存储目标投递失败：连接失败、超时、权限不足、网络中断等。
+
+    该异常只在同步层内部使用，永远不会传播到采集主流程。
+    """
