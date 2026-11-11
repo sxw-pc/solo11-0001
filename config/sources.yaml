@@ -68,3 +68,28 @@ sources:
       published_at: published_at
       content: content
       url: null
+
+  # 结构不同的第二套 HTML 站点：不复制适配器，仅靠 selectors 覆盖默认选择器接入。
+  # 省略的选择器项（此处五项全写）会沿用全局默认；默认 disabled，
+  # 可显式 `--source demo_html_alt` 运行。
+  - name: demo_html_alt
+    type: html
+    base_url: http://127.0.0.1:8010
+    enabled: false
+    page_size: 5
+    timeout_seconds: 10
+    list_path: /portal/list
+    detail_path: /portal/article/{id}
+    field_map:
+      title: title
+      category: category
+      tags: tags
+      published_at: published_at
+      content: content
+      url: null
+    selectors:
+      title: h2.headline
+      category: em.channel
+      tags: ul.keyword-list
+      date: time.publish-time
+      content: article.article-body

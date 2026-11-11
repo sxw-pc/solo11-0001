@@ -16,6 +16,7 @@ from flask import Flask, Response, jsonify, request
 DEFAULT_FIXTURES = Path(__file__).resolve().parent / "fixtures"
 HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 HTML_ID_PATTERN = re.compile(r"html-(\d+)")
+ALT_ID_PATTERN = re.compile(r"alt-(\d+)")
 EMPTY_LIST_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>公开数据列表（空）</title></head>
@@ -37,6 +38,8 @@ INDEX_HTML = """<!doctype html>
   <li><a href="/api/items/api-1">API 详情示例</a></li>
   <li><a href="/list?page=1">HTML 列表</a></li>
   <li><a href="/item/html-1">HTML 详情示例</a></li>
+  <li><a href="/portal/list?page=1">HTML 门户列表（另一套结构）</a></li>
+  <li><a href="/portal/article/alt-1">HTML 门户详情示例</a></li>
 </ul>
 </body>
 </html>
@@ -105,6 +108,32 @@ def create_app(fixtures_dir: str | Path | None = None) -> Flask:
         if match is None:
             return "not found", 404
         path = fixtures / "html" / f"item_{match.group(1)}.html"
+        if not path.is_file():
+            return "not found", 404
+        return Response(path.read_text(encoding="utf-8"), content_type=HTML_CONTENT_TYPE)
+
+    @app.get("/portal/list")
+    def html_alt_list() -> Response | tuple[str, int]:
+        """结构不同的第二套 HTML 站点列表页（html_alt fixture）。"""
+
+        if _flag("fail"):
+            return "simulated list failure", 503
+        page = _positive_int("page", 1)
+        path = fixtures / "html_alt" / f"list_{page}.html"
+        if not path.is_file():
+            return Response(EMPTY_LIST_HTML, content_type=HTML_CONTENT_TYPE)
+        return Response(path.read_text(encoding="utf-8"), content_type=HTML_CONTENT_TYPE)
+
+    @app.get("/portal/article/<item_id>")
+    def html_alt_detail(item_id: str) -> Response | tuple[str, int]:
+        """结构不同的第二套 HTML 站点详情页（html_alt fixture）。"""
+
+        if _flag("fail"):
+            return "<h1>模拟故障</h1>", 500
+        match = ALT_ID_PATTERN.fullmatch(item_id)
+        if match is None:
+            return "not found", 404
+        path = fixtures / "html_alt" / f"item_{match.group(1)}.html"
         if not path.is_file():
             return "not found", 404
         return Response(path.read_text(encoding="utf-8"), content_type=HTML_CONTENT_TYPE)
