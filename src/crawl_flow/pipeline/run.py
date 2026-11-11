@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from crawl_flow.config import SourceConfig
-from crawl_flow.errors import FetchError, ParseError
+from crawl_flow.errors import FetchError, ParseError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
 from crawl_flow.models import RawRecord
@@ -57,7 +57,8 @@ def run_source(
 ) -> RunSummary:
     """采集一个源。
 
-    列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
+    列表页请求/解析失败会抛出异常并终止本轮；单条详情的抓取、解析以及
+    raw 落盘失败只把该条记为 failed 并继续（数据库写入失败仍会中止整轮）。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
     """
 
@@ -122,7 +123,12 @@ def process_item(
     dry_run: bool,
     logger: logging.Logger,
 ) -> ItemOutcome:
-    """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。"""
+    """抓取并处理单条详情。
+
+    详情的 :class:`FetchError` / :class:`ParseError` 以及 raw 落盘的
+    :class:`StoreError` 都被隔离为 failed；数据库写入的
+    :class:`StoreError` 仍然向上抛出（整轮中止）。
+    """
 
     source = adapter.source
     started = time.perf_counter()
@@ -184,12 +190,29 @@ def process_item(
         )
 
     if not dry_run:
-        raw_path = raw_store.save(
-            source=source.name,
-            external_id=item.external_id,
-            payload=_success_payload(source.name, item, result, fetched_at),
-            fetched_at=fetched_at,
-        )
+        try:
+            raw_path = raw_store.save(
+                source=source.name,
+                external_id=item.external_id,
+                payload=_success_payload(source.name, item, result, fetched_at),
+                fetched_at=fetched_at,
+            )
+        except StoreError as exc:
+            # 单条 raw 落盘失败（磁盘满、权限不足等）只隔离当前条目，
+            # 不中断整轮，已成功处理的其他条目与本条元信息照常入库。
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            return _fail(
+                source.name,
+                item,
+                db=db,
+                raw_store=raw_store,
+                dry_run=dry_run,
+                logger=logger,
+                error=str(exc),
+                elapsed_ms=elapsed_ms,
+                fetched_at=fetched_at,
+                result=result,
+            )
         db.upsert_raw(
             RawRecord(
                 source=source.name,
@@ -222,15 +245,29 @@ def _fail(
     fetched_at: datetime,
     result: FetchResult | None = None,
 ) -> ItemOutcome:
+    """记录单条失败：尽力落故障快照，随后写 ``raw_records`` 失败行。
+
+    快照落盘失败只记日志（``raw_path`` 置空），不中断整轮。
+    """
+
     summary = error.strip().replace("\n", " ")[:MAX_ERROR_LENGTH]
+    raw_path: str | None = None
     if not dry_run:
         payload = _failure_payload(source_name, item, fetched_at, summary, result)
-        raw_path = raw_store.save(
-            source=source_name,
-            external_id=item.external_id,
-            payload=payload,
-            fetched_at=fetched_at,
-        )
+        try:
+            raw_path = raw_store.save(
+                source=source_name,
+                external_id=item.external_id,
+                payload=payload,
+                fetched_at=fetched_at,
+            )
+        except StoreError as exc:
+            logger.warning(
+                "raw snapshot save failed source=%s external_id=%s error=%s",
+                source_name,
+                item.external_id,
+                exc,
+            )
         db.upsert_raw(
             RawRecord(
                 source=source_name,
