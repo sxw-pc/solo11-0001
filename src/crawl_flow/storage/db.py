@@ -1,7 +1,8 @@
-"""SQLite 持久化：建表、幂等 upsert、统计查询。"""
+"""SQLite 持久化：建表、幂等 upsert、统计查询、raw 元信息检索。"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
 from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+
+DEFAULT_SEARCH_LIMIT = 100
+MAX_SEARCH_LIMIT = 10_000
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -30,6 +34,36 @@ RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+@dataclass(frozen=True)
+class RawSearchFilter:
+    """raw_records 检索条件，全部可选；所有维度都走数据库索引/条件过滤。"""
+
+    source: str | None = None
+    external_id: str | None = None
+    status: str | None = None
+    error_keyword: str | None = None
+    start: datetime | None = None
+    end: datetime | None = None
+
+
+@dataclass(frozen=True)
+class RawSearchPage:
+    """一页检索结果：当前页行、满足条件的总行数（与分页无关）、实际使用的 limit。"""
+
+    rows: list[RawRecord]
+    total: int
+    limit: int
+    offset: int
+
+
+def normalize_naive_utc(value: datetime) -> datetime:
+    """把带时区的时间转成 UTC naive，与 SQLite 里存储的 fetched_at 口径一致。"""
+
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 class Database:
@@ -124,6 +158,81 @@ class Database:
             if status is not None:
                 statement = statement.where(RawRecordRow.status == status)
             return int(session.execute(statement).scalar_one())
+
+    def search_raw(
+        self,
+        search_filter: RawSearchFilter | None = None,
+        *,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+        offset: int = 0,
+    ) -> RawSearchPage:
+        """按元信息维度检索 raw_records，不触碰 raw 文件。
+
+        过滤与排序全部在 SQLite 内完成（source/status 等可命中既有索引），
+        只有正文关键词检索才由调用方在结果之上按需加载 raw 文件。
+        ``limit`` 默认 100，防止一次性把整张表读进内存。
+        """
+
+        search_filter = search_filter or RawSearchFilter()
+        limit = min(max(limit, 1), MAX_SEARCH_LIMIT)
+        offset = max(offset, 0)
+        conditions = []
+        if search_filter.source is not None:
+            conditions.append(RawRecordRow.source == search_filter.source)
+        if search_filter.external_id is not None:
+            conditions.append(RawRecordRow.external_id == search_filter.external_id)
+        if search_filter.status is not None:
+            conditions.append(RawRecordRow.status == search_filter.status)
+        if search_filter.error_keyword:
+            escaped = (
+                search_filter.error_keyword.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            conditions.append(
+                RawRecordRow.error.like(f"%{escaped}%", escape="\\")
+            )
+        if search_filter.start is not None:
+            conditions.append(
+                RawRecordRow.fetched_at >= normalize_naive_utc(search_filter.start)
+            )
+        if search_filter.end is not None:
+            conditions.append(
+                RawRecordRow.fetched_at <= normalize_naive_utc(search_filter.end)
+            )
+
+        try:
+            with Session(self.engine) as session:
+                total = int(
+                    session.execute(
+                        select(func.count())
+                        .select_from(RawRecordRow)
+                        .where(*conditions)
+                    ).scalar_one()
+                )
+                result = session.execute(
+                    select(RawRecordRow)
+                    .where(*conditions)
+                    .order_by(RawRecordRow.fetched_at.desc(), RawRecordRow.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                ).scalars().all()
+                rows = [
+                    RawRecord(
+                        source=row.source,
+                        external_id=row.external_id,
+                        url=row.url,
+                        http_status=row.http_status,
+                        fetched_at=row.fetched_at,
+                        status=row.status,
+                        error=row.error,
+                        raw_path=row.raw_path,
+                    )
+                    for row in result
+                ]
+        except SQLAlchemyError as exc:
+            raise StoreError(f"raw_records 检索失败 error={exc}") from exc
+        return RawSearchPage(rows=rows, total=total, limit=limit, offset=offset)
 
     def stats(self) -> dict[str, Any]:
         """按源汇总 records 数量、raw 成功/失败数量与最近抓取时间。"""

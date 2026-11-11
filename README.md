@@ -42,6 +42,8 @@ crawl-flow db stats
 | --- | --- |
 | 起 mock 站点 | `crawl-flow serve-mock --port 8010` |
 | 跑一次采集 | `crawl-flow run --source demo_api --limit 5` / `crawl-flow run --all` |
+| 检索原始响应 | `crawl-flow raw search --status failed --error-keyword "HTTP 500"` |
+| 导出原始响应 | `crawl-flow raw export -o raw.json --source demo_api`（加 `--with-content` 才含完整正文） |
 | 跑测试 | `pytest -q` |
 
 其他可用命令与参数：
@@ -50,7 +52,15 @@ crawl-flow db stats
 crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库
 crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
 crawl-flow db stats --db data/crawl.db
+crawl-flow raw search --source demo_api --from 2026-11-01 --to 2026-11-12
+crawl-flow raw search --body-keyword 数据库 --max-scan 1000  # 按需读 raw 文件全文匹配
+crawl-flow raw export -o raw.json --with-content             # 默认仅导出元信息
 ```
+
+`raw search` 支持按 `--source` / `--external-id` / `--status` / `--error-keyword` /
+`--from`/`--to` 过滤，默认只查 `raw_records` 索引、最多返回 100 条；只有加
+`--body-keyword` 才按需加载 raw 文件做正文检索，不做目录全量扫描。损坏、缺失或
+无权限的 raw 文件只产生告警，不会中断检索。
 
 ## 目录速览
 
