@@ -45,6 +45,10 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    # 每日请求预算，按 UTC 自然日归零；None 表示不限制、维持无预算行为。
+    daily_request_limit: int | None = Field(default=None, ge=1)
+    # 每日响应体字节预算（按实际接收的解码字节计）；None 表示不限制。
+    daily_bytes_limit: int | None = Field(default=None, ge=1)
 
     @field_validator("base_url")
     @classmethod

@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from mock_site.app import create_app  # noqa: E402
 
 from crawl_flow.config import SourceConfig  # noqa: E402
+from crawl_flow.budget import BudgetLedger, BudgetLimits, SqliteBudgetMeter  # noqa: E402
 from crawl_flow.fetch.client import Fetcher  # noqa: E402
 from crawl_flow.storage.db import Database  # noqa: E402
 from crawl_flow.storage.raw_store import RawStore  # noqa: E402
@@ -119,3 +120,34 @@ def source_payload(mock_base_url: str) -> Any:
         return payload
 
     return _payload
+
+
+@pytest.fixture
+def ledger(tmp_path: Path) -> Iterator[BudgetLedger]:
+    budget_ledger = BudgetLedger(tmp_path / "budget.db")
+    try:
+        yield budget_ledger
+    finally:
+        budget_ledger.close()
+
+
+@pytest.fixture
+def make_limits() -> Any:
+    def _make(
+        name: str = "demo_api",
+        *,
+        requests: int | None = None,
+        bytes_: int | None = None,
+    ) -> BudgetLimits:
+        return BudgetLimits(
+            source=name,
+            daily_request_limit=requests,
+            daily_bytes_limit=bytes_,
+        )
+
+    return _make
+
+
+@pytest.fixture
+def meter(ledger: BudgetLedger) -> SqliteBudgetMeter:
+    return SqliteBudgetMeter(ledger)

@@ -1,5 +1,9 @@
 # crawl-flow 源配置
 # 每个源必须包含 name / type / base_url；page_size 只对 api 类型生效。
+# 预算字段（均可选，不配 = 该维度完全不限制）：
+#   daily_request_limit: 每日请求次数上限（含列表页/详情页/重试/重定向，按 UTC 自然日归零）
+#   daily_bytes_limit:   每日响应字节上限（按实际接收的响应体字节计，按 UTC 自然日归零）
+# 任一额度触顶，该源在发出下一次请求前熔断，已完成条目正常入库。
 sources:
   - name: demo_api
     type: api
@@ -7,6 +11,9 @@ sources:
     enabled: true
     page_size: 5
     timeout_seconds: 10
+    # 每日最多 50 次请求、最多 2 MiB 响应字节；删除这两行即不限制。
+    daily_request_limit: 50
+    daily_bytes_limit: 2097152
     # 默认路径分别是 /api/items 与 /api/items/{id}，这里显式写出便于阅读
     list_path: /api/items
     detail_path: /api/items/{id}
@@ -24,6 +31,7 @@ sources:
     enabled: true
     page_size: 5
     timeout_seconds: 10
+    # 未配置任何预算上限：只记账、不熔断，行为与无预算时一致。
     list_path: /list
     detail_path: /item/{id}
     field_map:

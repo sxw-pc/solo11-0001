@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Engine, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
@@ -27,6 +28,11 @@ RECORD_UPDATE_FIELDS = (
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
 
+# 两个采集进程同时首次建库时，CREATE TABLE 可能撞上并发进程的锁或
+# 「table already exists」，按指数退避重试，累计约 10 秒。
+INIT_MAX_ATTEMPTS = 15
+INIT_RETRY_DELAY_SECONDS = 0.05
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -43,12 +49,28 @@ class Database:
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def init(self) -> None:
-        """创建两张表及索引（幂等）。"""
+        """创建两张表及索引（幂等）。
 
-        try:
-            Base.metadata.create_all(self.engine)
-        except SQLAlchemyError as exc:
-            raise StoreError(f"建表失败 db={self.path} error={exc}") from exc
+        多进程同时首次建库时，``CREATE TABLE`` 可能因并发锁或
+        ``table already exists`` 失败，按固定间隔重试后仍失败才抛错。
+        """
+
+        last_error: Exception | None = None
+        for attempt in range(INIT_MAX_ATTEMPTS):
+            try:
+                Base.metadata.create_all(self.engine)
+                return
+            except OperationalError as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if "already exists" in message or "locked" in message or "busy" in message:
+                    if attempt + 1 < INIT_MAX_ATTEMPTS:
+                        time.sleep(INIT_RETRY_DELAY_SECONDS * (2**attempt))
+                        continue
+                raise StoreError(f"建表失败 db={self.path} error={exc}") from exc
+            except SQLAlchemyError as exc:
+                raise StoreError(f"建表失败 db={self.path} error={exc}") from exc
+        raise StoreError(f"建表失败（并发建库重试耗尽） db={self.path} error={last_error}")
 
     def upsert_record(self, record: Record) -> None:
         """按 (source, external_id) 幂等写入；重复采集只更新内容与时间戳。"""

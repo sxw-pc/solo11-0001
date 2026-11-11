@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from crawl_flow.budget.errors import BudgetExceededError
+from crawl_flow.budget.meter import DryRunBudgetMeter, SqliteBudgetMeter
 from crawl_flow.config import SourceConfig
 from crawl_flow.errors import FetchError, ParseError
 from crawl_flow.fetch.client import Fetcher
@@ -43,6 +45,16 @@ class RunSummary:
     skipped: int = 0
     elapsed_ms: int = 0
     results: list[ItemOutcome] = field(default_factory=list)
+    # 预算维度：本进程本轮新增的请求数/字节数，以及是否被熔断。
+    budget_requests: int = 0
+    budget_bytes: int = 0
+    budget_broken: bool = False
+    budget_break_reason: str | None = None
+    dry_run: bool = False
+
+
+# 记账器的结构化类型（鸭子类型，避免引入具体实现依赖）。
+BudgetMeter = SqliteBudgetMeter | DryRunBudgetMeter
 
 
 def run_source(
@@ -54,61 +66,98 @@ def run_source(
     limit: int | None = None,
     dry_run: bool = False,
     logger: logging.Logger | None = None,
+    meter: BudgetMeter | None = None,
 ) -> RunSummary:
     """采集一个源。
 
     列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
+
+    注入 ``meter`` 后，每个 HTTP 请求发出前都会经过预算账本预留额度；
+    额度触顶时在请求发出前抛出的 :class:`BudgetExceededError` 会在这里被
+    转成本源汇总里的熔断标记——已完成条目正常保留，同轮其他源不受影响。
     """
 
     log = logger or logging.getLogger(LOGGER_NAME)
     owns_fetcher = fetcher is None
     active_fetcher = fetcher or Fetcher(timeout=source.timeout_seconds)
     adapter = create_adapter(source, active_fetcher)
-    summary = RunSummary(source=source.name)
+    summary = RunSummary(source=source.name, dry_run=dry_run)
     started = time.perf_counter()
     seen: set[str] = set()
     processed = 0
 
+    if meter is not None:
+        meter.bind_source(source.name)
     try:
-        for page in adapter.iter_list_pages():
-            for item in page.items:
-                if item.external_id in seen:
-                    summary.skipped += 1
-                    log_item(log, source.name, item.external_id, "skipped", 0)
-                    continue
-                seen.add(item.external_id)
-                if limit is not None and processed >= limit:
-                    summary.skipped += 1
-                    log_item(log, source.name, item.external_id, "skipped", 0)
-                    continue
-                processed += 1
-                outcome = process_item(
-                    adapter,
-                    item,
-                    db=db,
-                    raw_store=raw_store,
-                    dry_run=dry_run,
-                    logger=log,
-                )
-                summary.results.append(outcome)
-                if outcome.status == "ok":
-                    summary.ok += 1
-                else:
-                    summary.failed += 1
+        try:
+            for page in adapter.iter_list_pages():
+                for item in page.items:
+                    if item.external_id in seen:
+                        summary.skipped += 1
+                        log_item(log, source.name, item.external_id, "skipped", 0)
+                        continue
+                    seen.add(item.external_id)
+                    if limit is not None and processed >= limit:
+                        summary.skipped += 1
+                        log_item(log, source.name, item.external_id, "skipped", 0)
+                        continue
+                    processed += 1
+                    outcome = process_item(
+                        adapter,
+                        item,
+                        db=db,
+                        raw_store=raw_store,
+                        dry_run=dry_run,
+                        logger=log,
+                    )
+                    summary.results.append(outcome)
+                    if outcome.status == "ok":
+                        summary.ok += 1
+                    else:
+                        summary.failed += 1
+        except BudgetExceededError as exc:
+            # 熔断发生在请求发出之前：本轮已完成的条目都已落库，直接收尾。
+            summary.budget_broken = True
+            summary.budget_break_reason = exc.reason
+            if isinstance(meter, SqliteBudgetMeter):
+                meter.mark_request_break(exc)
+            log.warning(
+                "budget circuit breaker source=%s metric=%s used=%s limit=%s reason=%s",
+                exc.source,
+                exc.metric,
+                exc.used,
+                exc.limit,
+                exc.reason,
+            )
     finally:
+        if meter is not None:
+            meter.unbind_source()
         if owns_fetcher:
             active_fetcher.close()
 
+    if meter is not None:
+        estimate = meter.estimate(source.name)
+        summary.budget_requests = estimate.requests
+        summary.budget_bytes = estimate.response_bytes
+        if estimate.would_break and not summary.budget_broken:
+            # dry-run 估算触顶不会抛异常，通过估算字段带到汇总。
+            summary.budget_broken = True
+            summary.budget_break_reason = estimate.break_reason
+
     summary.elapsed_ms = int((time.perf_counter() - started) * 1000)
     log.info(
-        "run summary source=%s ok=%d failed=%d skipped=%d elapsed_ms=%d dry_run=%s",
+        "run summary source=%s ok=%d failed=%d skipped=%d elapsed_ms=%d dry_run=%s "
+        "budget_requests=%d budget_bytes=%d budget_broken=%s",
         summary.source,
         summary.ok,
         summary.failed,
         summary.skipped,
         summary.elapsed_ms,
         str(dry_run).lower(),
+        summary.budget_requests,
+        summary.budget_bytes,
+        str(summary.budget_broken).lower(),
     )
     return summary
 
