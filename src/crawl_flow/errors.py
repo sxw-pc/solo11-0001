@@ -37,3 +37,10 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class CliArgumentError(CrawlFlowError):
+    """CLI 参数在发请求前的统一校验失败（非法值、路径不可用等）。
+
+    CLI 边界捕获后打印可读信息、不输出堆栈，并以退出码 2 结束。
+    """

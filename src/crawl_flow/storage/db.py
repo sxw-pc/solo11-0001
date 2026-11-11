@@ -38,7 +38,10 @@ class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         if str(self.path) != ":memory:":
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise StoreError(f"数据库目录创建失败 db={self.path} error={exc}") from exc
         self.engine: Engine = _create_engine(self.path)
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
