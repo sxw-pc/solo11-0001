@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -16,6 +19,64 @@ DEFAULT_PATHS: dict[str, tuple[str, str]] = {
     "api": ("/api/items", "/api/items/{id}"),
     "html": ("/list", "/item/{id}"),
 }
+
+# 仅支持 ``${NAME}`` 形式；变量名遵循常见 shell 标识符规则，保证跨平台一致。
+ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# 这些字段参与适配器注册 / 身份识别，写成枚举或严格标识符，禁止环境变量占位。
+PLACEHOLDER_FORBIDDEN_FIELDS = ("name", "type")
+
+
+def _resolve_env_string(value: str, *, path: str, environ: Mapping[str, str]) -> str:
+    """替换字符串中的全部 ``${ENV_VAR}``；缺失变量抛 :class:`ConfigError`。"""
+
+    def replace(match: re.Match[str]) -> str:
+        variable = match.group(1)
+        if variable not in environ:
+            raise ConfigError(f"环境变量缺失: {variable}（字段 {path}）")
+        return environ[variable]
+
+    return ENV_PLACEHOLDER.sub(replace, value)
+
+
+def _expand_env_placeholders(
+    value: Any,
+    *,
+    path: str,
+    environ: Mapping[str, str],
+) -> Any:
+    """递归展开配置值中的环境变量占位，字典键不参与展开。"""
+
+    if isinstance(value, str):
+        return _resolve_env_string(value, path=path, environ=environ)
+    if isinstance(value, list):
+        return [
+            _expand_env_placeholders(item, path=f"{path}[{index}]", environ=environ)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _expand_env_placeholders(
+                item,
+                path=f"{path}.{key}" if path else str(key),
+                environ=environ,
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
+def _check_placeholder_allowed(item: Any, *, index: int) -> None:
+    """枚举 / 标识符字段禁止占位符，避免破坏适配器注册与源身份。"""
+
+    if not isinstance(item, dict):
+        return
+    for field in PLACEHOLDER_FORBIDDEN_FIELDS:
+        raw_value = item.get(field)
+        if isinstance(raw_value, str) and ENV_PLACEHOLDER.search(raw_value):
+            raise ConfigError(
+                f"禁止在枚举字段 sources[{index}].{field} 中使用环境变量占位符"
+            )
 
 
 class FieldMapping(BaseModel):
@@ -65,9 +126,18 @@ class SourceConfig(BaseModel):
         return self
 
 
-def load_sources(path: str | Path) -> list[SourceConfig]:
-    """读取并校验源配置，任何问题统一抛 :class:`ConfigError`。"""
+def load_sources(
+    path: str | Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> list[SourceConfig]:
+    """读取并校验源配置，任何问题统一抛 :class:`ConfigError`。
 
+    字符串字段支持 ``${ENV_VAR}`` 环境变量占位；``name`` / ``type`` 等
+    枚举与标识符字段禁止使用占位符。
+    """
+
+    env = os.environ if environ is None else environ
     config_path = Path(path)
     if not config_path.is_file():
         raise ConfigError(f"配置文件不存在: {config_path}")
@@ -86,8 +156,14 @@ def load_sources(path: str | Path) -> list[SourceConfig]:
 
     sources: list[SourceConfig] = []
     for index, item in enumerate(raw_sources, start=1):
+        _check_placeholder_allowed(item, index=index)
+        resolved_item = _expand_env_placeholders(
+            item,
+            path=f"sources[{index}]",
+            environ=env,
+        )
         try:
-            sources.append(SourceConfig.model_validate(item))
+            sources.append(SourceConfig.model_validate(resolved_item))
         except ValidationError as exc:
             raise ConfigError(f"sources[{index}] 校验失败: {exc}") from exc
 

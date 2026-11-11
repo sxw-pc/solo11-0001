@@ -8,11 +8,13 @@ from typing import Optional
 
 import typer
 
-from crawl_flow.config import load_sources, select_sources
+from crawl_flow.config import SourceConfig, load_sources, select_sources
+from crawl_flow.config_watch import ConfigWatcher
 from crawl_flow.errors import ConfigError, FetchError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
 from crawl_flow.pipeline.run import RunSummary, run_source
+from crawl_flow.pipeline.watch import run_watch_loop
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
 
@@ -39,13 +41,34 @@ def run_command(
     config: Path = typer.Option(DEFAULT_CONFIG, "--config", help="源配置文件路径"),
     db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
     raw_dir: Path = typer.Option(DEFAULT_RAW_DIR, "--raw-dir", help="原始响应目录"),
+    watch: bool = typer.Option(
+        False,
+        "--watch",
+        help="持续运行并定期检测配置变更，热重载启用状态的源（Ctrl+C 退出）",
+    ),
+    watch_interval: float = typer.Option(
+        2.0,
+        "--watch-interval",
+        min=0.05,
+        help="--watch 模式下检测配置文件的间隔秒数",
+    ),
 ) -> None:
-    """跑一轮采集。"""
+    """跑一轮采集；带 --watch 时持续采集并热重载配置。"""
 
     logger = configure_logging(verbose)
+    watcher: ConfigWatcher | None = None
+    selected: list[SourceConfig] = []
     try:
-        sources = load_sources(config)
-        selected = select_sources(sources, name=source, all_sources=all_sources)
+        if watch:
+            watcher = ConfigWatcher(config, logger=logger)
+            initial_sources = watcher.load()
+            # 首次加载阶段仍要严格校验 --source / --all，失败按退出码 2 结束。
+            selected = select_sources(
+                initial_sources, name=source, all_sources=all_sources
+            )
+        else:
+            sources = load_sources(config)
+            selected = select_sources(sources, name=source, all_sources=all_sources)
     except ConfigError as exc:
         typer.secho(f"配置错误: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -56,18 +79,39 @@ def run_command(
     try:
         db.init()
         with Fetcher() as fetcher:
-            for selected_source in selected:
-                summaries.append(
-                    run_source(
-                        selected_source,
+            if watch:
+                try:
+                    summaries = run_watch_loop(
+                        watcher,
                         db,
                         raw_store,
-                        fetcher=fetcher,
+                        fetcher,
+                        name=source,
+                        all_sources=all_sources,
                         limit=limit,
                         dry_run=dry_run,
+                        poll_interval=watch_interval,
                         logger=logger,
+                        on_round=lambda round_no, round_summaries: _print_round(
+                            round_no, round_summaries, dry_run=dry_run
+                        ),
                     )
-                )
+                except KeyboardInterrupt:
+                    typer.echo("watch 已停止")
+                    return
+            else:
+                for selected_source in selected:
+                    summaries.append(
+                        run_source(
+                            selected_source,
+                            db,
+                            raw_store,
+                            fetcher=fetcher,
+                            limit=limit,
+                            dry_run=dry_run,
+                            logger=logger,
+                        )
+                    )
     except FetchError as exc:
         typer.secho(f"采集失败（整轮中止）: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -77,7 +121,8 @@ def run_command(
     finally:
         db.close()
 
-    _print_summaries(summaries, dry_run=dry_run)
+    if not watch:
+        _print_summaries(summaries, dry_run=dry_run)
 
 
 @db_app.command("stats")
@@ -143,6 +188,16 @@ def serve_mock(
 def _print_summaries(summaries: list[RunSummary], *, dry_run: bool) -> None:
     mode = "（dry-run，未写 raw 与数据库）" if dry_run else ""
     typer.echo(f"本轮汇总{mode}")
+    _print_summary_lines(summaries)
+
+
+def _print_round(round_no: int, summaries: list[RunSummary], *, dry_run: bool) -> None:
+    mode = "（dry-run，未写 raw 与数据库）" if dry_run else ""
+    typer.echo(f"第 {round_no} 轮汇总{mode}")
+    _print_summary_lines(summaries)
+
+
+def _print_summary_lines(summaries: list[RunSummary]) -> None:
     for summary in summaries:
         typer.echo(
             f"source={summary.source} ok={summary.ok} failed={summary.failed} "
