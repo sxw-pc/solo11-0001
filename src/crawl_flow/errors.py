@@ -37,3 +37,11 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class RuleConfigError(CrawlFlowError):
+    """规则配置缺失、语法错误或算子参数校验失败。
+
+    规则引擎是可降级组件：该异常只在启动加载与 ``rules check`` 时抛出，
+    采集主流程捕获后降级为默认清洗逻辑，不中断任务。
+    """

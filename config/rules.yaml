@@ -1,0 +1,83 @@
+# crawl-flow 规则引擎配置：字段清洗规则 + 质量校验规则
+#
+# 结构说明：
+#   defaults              全局默认：低质量阈值、质量失败处理模式（skip/mark/warn）
+#   default               未单独配置的源使用的兜底规则（可选）
+#   sources.<源名>        按源独立配置，可覆盖 defaults 的阈值与处理模式
+#     fields.<源字段名>   按字段配置规则链，规则按列表顺序依次执行
+#
+# 每条规则：
+#   name        算子名（必填），可用算子：
+#               清洗类 strip / truncate / regex_replace / date_format /
+#                      default / type_cast / map_values
+#               校验类 required / enum / length / pattern / range
+#   params      算子参数（可选），非法参数在启动校验时报错
+#   weight      未命中扣分（0-100，默认 10）；质量分 = 100 - 命中规则的扣分之和
+#   on_failure  该规则未命中时的处理模式覆盖（skip/mark/warn，可选）
+#
+# 质量分低于 threshold 的条目按 on_quality_failure 处理：
+#   skip  不入库（记 skipped）；mark  入库并标记 low_quality；warn  仅告警
+#
+# 校验方式：`crawl-flow rules check`；配置错误时采集自动降级为默认清洗逻辑。
+
+defaults:
+  threshold: 60
+  on_quality_failure: mark
+
+# 兜底规则：未在 sources 中配置的源使用
+default:
+  fields:
+    content:
+      rules:
+        - name: truncate
+          params: {max_length: 5000}
+
+sources:
+  demo_api:
+    threshold: 60
+    on_quality_failure: mark
+    fields:
+      title:
+        rules:
+          - name: strip
+          - name: truncate
+            params: {max_length: 100, suffix: "…"}
+          - name: required
+            weight: 50
+            on_failure: skip
+      category:
+        rules:
+          - name: enum
+            params: {values: [环境, 技术, 文化, 交通, 教育, 经济]}
+            weight: 20
+      published_at:
+        rules:
+          - name: date_format
+            params: {output: "%Y-%m-%d %H:%M:%S"}
+            weight: 15
+      tags:
+        rules:
+          - name: type_cast
+            params: {to: list}
+
+  demo_html:
+    threshold: 60
+    on_quality_failure: warn
+    fields:
+      title:
+        rules:
+          - name: strip
+          - name: required
+            weight: 50
+            on_failure: skip
+      category:
+        rules:
+          - name: enum
+            params: {values: [环境, 技术, 文化, 交通, 教育, 经济]}
+            weight: 20
+      published_at:
+        rules:
+          # formats 省略时使用内置常见格式（含 ISO、斜杠、点号、中文日期）
+          - name: date_format
+            params: {output: "%Y-%m-%d %H:%M:%S"}
+            weight: 15

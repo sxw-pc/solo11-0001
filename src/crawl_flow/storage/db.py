@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, func, select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -23,6 +23,8 @@ RECORD_UPDATE_FIELDS = (
     "url",
     "fetched_at",
     "updated_at",
+    "quality_score",
+    "low_quality",
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
@@ -43,12 +45,35 @@ class Database:
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def init(self) -> None:
-        """创建两张表及索引（幂等）。"""
+        """创建两张表及索引（幂等），并为老库补充质量列。"""
 
         try:
             Base.metadata.create_all(self.engine)
         except SQLAlchemyError as exc:
             raise StoreError(f"建表失败 db={self.path} error={exc}") from exc
+        self._migrate_quality_columns()
+
+    def _migrate_quality_columns(self) -> None:
+        """为已有数据库补充 records 的质量列（create_all 不会修改已有表）。"""
+
+        try:
+            with self.engine.begin() as conn:
+                existing = {
+                    row[1] for row in conn.execute(text("PRAGMA table_info(records)"))
+                }
+                if "quality_score" not in existing:
+                    conn.execute(
+                        text("ALTER TABLE records ADD COLUMN quality_score FLOAT")
+                    )
+                if "low_quality" not in existing:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE records ADD COLUMN "
+                            "low_quality BOOLEAN NOT NULL DEFAULT 0"
+                        )
+                    )
+        except SQLAlchemyError as exc:
+            raise StoreError(f"records 质量列迁移失败 db={self.path} error={exc}") from exc
 
     def upsert_record(self, record: Record) -> None:
         """按 (source, external_id) 幂等写入；重复采集只更新内容与时间戳。"""
@@ -65,6 +90,8 @@ class Database:
             "url": record.url,
             "fetched_at": fetched_at,
             "updated_at": _utcnow(),
+            "quality_score": record.quality_score,
+            "low_quality": record.low_quality,
         }
         try:
             with self._session_factory() as session:

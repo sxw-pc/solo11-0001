@@ -15,6 +15,7 @@ from crawl_flow.fetch.types import FetchResult
 from crawl_flow.models import RawRecord
 from crawl_flow.observability.logging import log_item
 from crawl_flow.pipeline.normalize import normalize_record
+from crawl_flow.rules.engine import RuleEngine, RuleResult
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
@@ -31,6 +32,8 @@ class ItemOutcome:
     status: str
     elapsed_ms: int
     error: str | None = None
+    quality_score: float | None = None
+    low_quality: bool = False
 
 
 @dataclass
@@ -41,6 +44,7 @@ class RunSummary:
     ok: int = 0
     failed: int = 0
     skipped: int = 0
+    low_quality: int = 0
     elapsed_ms: int = 0
     results: list[ItemOutcome] = field(default_factory=list)
 
@@ -54,11 +58,13 @@ def run_source(
     limit: int | None = None,
     dry_run: bool = False,
     logger: logging.Logger | None = None,
+    rule_engine: RuleEngine | None = None,
 ) -> RunSummary:
     """采集一个源。
 
     列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
+    ``rule_engine`` 为空时按内置默认逻辑清洗字段。
     """
 
     log = logger or logging.getLogger(LOGGER_NAME)
@@ -90,23 +96,30 @@ def run_source(
                     raw_store=raw_store,
                     dry_run=dry_run,
                     logger=log,
+                    rule_engine=rule_engine,
                 )
                 summary.results.append(outcome)
                 if outcome.status == "ok":
                     summary.ok += 1
+                elif outcome.status == "skipped":
+                    summary.skipped += 1
                 else:
                     summary.failed += 1
+                if outcome.low_quality:
+                    summary.low_quality += 1
     finally:
         if owns_fetcher:
             active_fetcher.close()
 
     summary.elapsed_ms = int((time.perf_counter() - started) * 1000)
     log.info(
-        "run summary source=%s ok=%d failed=%d skipped=%d elapsed_ms=%d dry_run=%s",
+        "run summary source=%s ok=%d failed=%d skipped=%d low_quality=%d "
+        "elapsed_ms=%d dry_run=%s",
         summary.source,
         summary.ok,
         summary.failed,
         summary.skipped,
+        summary.low_quality,
         summary.elapsed_ms,
         str(dry_run).lower(),
     )
@@ -121,8 +134,13 @@ def process_item(
     raw_store: RawStore,
     dry_run: bool,
     logger: logging.Logger,
+    rule_engine: RuleEngine | None = None,
 ) -> ItemOutcome:
-    """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。"""
+    """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。
+
+    配置了规则引擎时，解析出的源字段先经规则链清洗与质量校验；
+    质量闸门判定为 skip 的条目不入库（记 skipped），mark/warn 继续入库。
+    """
 
     source = adapter.source
     started = time.perf_counter()
@@ -161,6 +179,54 @@ def process_item(
 
     try:
         fields = adapter.parse_detail(result, item.external_id)
+    except ParseError as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        return _fail(
+            source.name,
+            item,
+            db=db,
+            raw_store=raw_store,
+            dry_run=dry_run,
+            logger=logger,
+            error=exc.reason,
+            elapsed_ms=elapsed_ms,
+            fetched_at=fetched_at,
+            result=result,
+        )
+
+    rule_result = _apply_rules(rule_engine, source.name, item.external_id, fields, logger)
+    if rule_result is not None:
+        fields = rule_result.fields
+        if rule_result.report.action == "skip":
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            if not dry_run:
+                raw_path = raw_store.save(
+                    source=source.name,
+                    external_id=item.external_id,
+                    payload=_success_payload(source.name, item, result, fetched_at),
+                    fetched_at=fetched_at,
+                )
+                db.upsert_raw(
+                    RawRecord(
+                        source=source.name,
+                        external_id=item.external_id,
+                        url=result.url,
+                        http_status=result.status_code,
+                        fetched_at=fetched_at,
+                        status="ok",
+                        error=None,
+                        raw_path=raw_path,
+                    )
+                )
+            log_item(logger, source.name, item.external_id, "skipped", elapsed_ms)
+            return ItemOutcome(
+                external_id=item.external_id,
+                status="skipped",
+                elapsed_ms=elapsed_ms,
+                quality_score=float(rule_result.report.score),
+            )
+
+    try:
         record = normalize_record(
             source,
             item.external_id,
@@ -182,6 +248,10 @@ def process_item(
             fetched_at=fetched_at,
             result=result,
         )
+
+    if rule_result is not None:
+        record.quality_score = float(rule_result.report.score)
+        record.low_quality = rule_result.report.low_quality
 
     if not dry_run:
         raw_path = raw_store.save(
@@ -206,7 +276,41 @@ def process_item(
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_item(logger, source.name, item.external_id, "ok", elapsed_ms)
-    return ItemOutcome(external_id=item.external_id, status="ok", elapsed_ms=elapsed_ms)
+    return ItemOutcome(
+        external_id=item.external_id,
+        status="ok",
+        elapsed_ms=elapsed_ms,
+        quality_score=record.quality_score,
+        low_quality=record.low_quality,
+    )
+
+
+def _apply_rules(
+    rule_engine: RuleEngine | None,
+    source_name: str,
+    external_id: str,
+    fields: dict[str, Any],
+    logger: logging.Logger,
+) -> RuleResult | None:
+    """执行字段规则；引擎自身异常时降级为默认清洗（返回 ``None``）。
+
+    规则引擎是可降级组件：单条规则异常已在引擎内部隔离，这里的兜底捕获
+    保证引擎级别的意外也不影响采集主流程。
+    """
+
+    if rule_engine is None:
+        return None
+    try:
+        return rule_engine.process(source_name, external_id, fields)
+    except Exception as exc:  # 可降级组件的兜底隔离，刻意放宽捕获范围
+        logger.warning(
+            "rule engine degraded, fallback to default cleaning "
+            "source=%s external_id=%s error=%s",
+            source_name,
+            external_id,
+            exc,
+        )
+        return None
 
 
 def _fail(
