@@ -23,6 +23,9 @@ RECORD_UPDATE_FIELDS = (
     "url",
     "fetched_at",
     "updated_at",
+    "quality_score",
+    "low_quality",
+    "quality_report",
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
@@ -43,12 +46,32 @@ class Database:
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def init(self) -> None:
-        """创建两张表及索引（幂等）。"""
+        """创建两张表及索引（幂等），并为旧库补齐规则引擎新增列。"""
 
         try:
             Base.metadata.create_all(self.engine)
+            self._migrate_quality_columns()
         except SQLAlchemyError as exc:
             raise StoreError(f"建表失败 db={self.path} error={exc}") from exc
+
+    def _migrate_quality_columns(self) -> None:
+        """SQLite 轻量迁移：旧版 records 表没有质量列时逐列 ADD COLUMN。"""
+
+        from sqlalchemy import inspect, text
+
+        inspector = inspect(self.engine)
+        if "records" not in inspector.get_table_names():
+            return
+        existing = {column["name"] for column in inspector.get_columns("records")}
+        additions = {
+            "quality_score": "ALTER TABLE records ADD COLUMN quality_score FLOAT NOT NULL DEFAULT 100.0",
+            "low_quality": "ALTER TABLE records ADD COLUMN low_quality BOOLEAN NOT NULL DEFAULT 0",
+            "quality_report": "ALTER TABLE records ADD COLUMN quality_report JSON NOT NULL DEFAULT '{}'",
+        }
+        with self.engine.begin() as connection:
+            for column, statement in additions.items():
+                if column not in existing:
+                    connection.execute(text(statement))
 
     def upsert_record(self, record: Record) -> None:
         """按 (source, external_id) 幂等写入；重复采集只更新内容与时间戳。"""
@@ -65,6 +88,9 @@ class Database:
             "url": record.url,
             "fetched_at": fetched_at,
             "updated_at": _utcnow(),
+            "quality_score": record.quality_score,
+            "low_quality": record.low_quality,
+            "quality_report": dict(record.quality_report),
         }
         try:
             with self._session_factory() as session:

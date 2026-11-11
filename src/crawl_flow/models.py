@@ -7,7 +7,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import (
+    Boolean,
     DateTime,
+    Float,
     Index,
     Integer,
     JSON,
@@ -34,6 +36,10 @@ class Record(BaseModel):
     content: str = ""
     url: str = ""
     fetched_at: datetime | None = None
+    # 规则引擎输出的字段质量信息（未启用规则时取默认值）。
+    quality_score: float = Field(default=100.0, ge=0, le=100)
+    low_quality: bool = False
+    quality_report: dict = Field(default_factory=dict)
 
 
 class RawRecord(BaseModel):
@@ -103,3 +109,6 @@ class RecordRow(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    quality_score: Mapped[float] = mapped_column(Float, nullable=False, default=100.0)
+    low_quality: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    quality_report: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)

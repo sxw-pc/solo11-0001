@@ -1,0 +1,176 @@
+# crawl-flow 字段规则引擎配置
+#
+# 启动期校验：`crawl-flow validate-rules`（或 run 时自动校验）。
+# 语法/参数错误会被逐条列出；run 时遇到错误不中断任务，自动降级为默认清洗。
+#
+# 层级：顶层（全局，对所有来源生效）→ sources.<name>（来源级，按字段覆盖）。
+# 清洗规则按 rules 列表顺序执行；validations 为质量校验，失败按 on_fail 处置。
+# 校验失败处置模式：skip=跳过不入库 / mark=标记后入库（默认）/ warn=仅告警。
+
+version: 1
+
+# 质量评分全局设置
+quality:
+  threshold: 60              # 评分低于 60 标记为低质量
+  default_weight: 1.0        # 单条校验规则的默认权重
+  on_validation_fail: mark   # skip | mark | warn
+  low_quality_flag: true
+
+# 没有显式配置 rules 的字段，可用 field_defaults 统一兜底（此处仅演示，默认关闭）
+# field_defaults:
+#   rules:
+#     - type: trim
+
+fields:
+  # 标题：trim → 正则替换（去掉营销后缀）→ 截断，校验必填与长度
+  title:
+    type_hint: text
+    weight: 2.0              # 标题在整记录质量评分中的权重更高
+    rules:
+      - type: trim
+      - type: regex_replace
+        name: 去除营销后缀
+        params:
+          pattern: '[-—_【\[]*(官方|最新|热门|推荐)[】\]]*$'
+          replacement: ''
+      - type: truncate
+        params:
+          max_length: 200
+          suffix: '…'
+    validations:
+      - type: required
+      - type: length
+        params:
+          min: 2
+          max: 200
+
+  # 分类：枚举值校验（不区分大小写），失败仅告警
+  category:
+    type_hint: text
+    weight: 0.5
+    rules:
+      - type: trim
+      - type: case
+        params:
+          mode: lower
+    validations:
+      - type: enum
+        on_fail: warn
+        params:
+          values: [环境, 技术, 文化, 教育, 经济, 交通, 环境]
+          case_sensitive: false
+
+  # 标签：拆分去重 → 逐标签 trim，校验 1~10 个
+  tags:
+    type_hint: tags
+    weight: 0.5
+    rules:
+      - type: split_tags
+    validations:
+      - type: length
+        params:
+          min: 1
+          max: 10
+        on_fail: warn
+
+  # 发布日期：转换为统一的 YYYY-MM-DD 字符串，再由引擎转回 datetime
+  published_at:
+    type_hint: datetime
+    weight: 1.0
+    rules:
+      - type: trim
+      - type: date_format
+        name: 统一日期格式
+        params:
+          to_format: '%Y-%m-%d'
+          from_formats:
+            - '%Y-%m-%dT%H:%M:%S%z'
+            - '%Y-%m-%d %H:%M:%S'
+            - '%Y/%m/%d'
+            - '%Y年%m月%d日'
+        on_fail: keep           # 解析失败保留原值，后续仍可被默认日期解析兜底
+    validations:
+      - type: date_range
+        on_fail: warn
+        params:
+          min: '2000-01-01'
+          max: '2100-01-01'
+
+  # 正文：HTML 去标签 → 截断到 5000 字
+  content:
+    type_hint: multiline
+    weight: 1.0
+    rules:
+      - type: strip_html
+      - type: truncate
+        params:
+          max_length: 5000
+    validations:
+      - type: non_empty
+        on_fail: warn
+
+  # URL：正则校验 http(s) 链接
+  url:
+    type_hint: text
+    weight: 0.5
+    validations:
+      - type: regex
+        on_fail: mark
+        params:
+          pattern: '^https?://.+'
+
+# ---------------------------------------------------------------------------
+# 来源级独立配置：demo_html 的标题更短、阈值更严，并演示 skip 模式
+# ---------------------------------------------------------------------------
+sources:
+  demo_html:
+    quality:
+      threshold: 70            # 来源级阈值覆盖全局 60
+      on_validation_fail: mark
+    fields:
+      title:
+        type_hint: text
+        weight: 2.0
+        rules:
+          - type: trim
+          - type: truncate
+            params:
+              max_length: 100
+              suffix: '…'
+        validations:
+          - type: required
+          - type: length
+            params:
+              min: 2
+              max: 100
+      # HTML 源的标签是分隔字符串，演示 split_tags + 大小写归一
+      tags:
+        type_hint: tags
+        rules:
+          - type: split_tags
+          - type: trim
+        validations:
+          - type: non_empty
+            on_fail: warn
+
+  # 演示来源：质量校验失败直接跳过不入库（启用方式：把名称改成实际源或新建源）
+  demo_api_strict:
+    quality:
+      threshold: 80
+      on_validation_fail: skip
+    fields:
+      title:
+        type_hint: text
+        rules:
+          - type: trim
+        validations:
+          - type: required
+          - type: length
+            params:
+              min: 4
+      category:
+        type_hint: text
+        validations:
+          - type: enum
+            params:
+              values: [环境, 技术, 文化]

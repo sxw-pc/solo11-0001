@@ -52,18 +52,37 @@ crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
 crawl-flow db stats --db data/crawl.db
 ```
 
+### 字段规则引擎
+
+清洗规则与质量校验全部配置化（`config/rules.yaml`），无需改代码即可适配不同来源：
+
+```bash
+crawl-flow validate-rules                          # 启动期校验规则语法与参数
+crawl-flow run --source demo_api --rules config/rules.yaml
+```
+
+- 11 种清洗算子：`trim`、`truncate`、`regex_replace`、`remove_substring`、`case`、
+  `strip_html`、`multiline_clean`、`split_tags`、`join_tags`、`default_value`、`date_format`
+- 6 种校验算子：`required`、`non_empty`、`length`、`enum`、`regex`、`date_range`
+- 按字段、按来源独立配置，清洗规则按配置顺序执行
+- 质量评分按校验命中情况自动加权计算，低于阈值自动打低质量标记
+- 校验失败三种处置模式：`skip`（跳过不入库）/ `mark`（标记后入库）/ `warn`（仅告警）
+- 规则语法错误启动期一次性列出；运行期规则异常自动降级默认清洗，不影响采集主流程
+- 每条字段的处理前后值、降级与校验结果都写入日志与 raw 快照（`rule_trace`），全程可追溯
+
 ## 目录速览
 
 ```
 crawl-flow/
 ├── config/sources.yaml      # 源定义（demo_api / demo_html 等）
-├── src/crawl_flow/          # 管道实现（CLI、配置、适配器、存储）
+├── config/rules.yaml        # 字段清洗规则与质量校验配置
+├── src/crawl_flow/          # 管道实现（CLI、配置、适配器、规则引擎、存储）
 ├── mock_site/               # 本地 mock 站点与 fixtures
 ├── tests/                   # pytest 测试（自带随机端口 mock 服务）
 └── docs/项目说明.md         # 详细设计、数据模型与测试说明
 ```
 
-完整结构、F1–F8 功能拆解、数据表字段与关键流程见 [docs/项目说明.md](docs/项目说明.md)。
+完整结构、F1–F9 功能拆解、数据表字段与关键流程见 [docs/项目说明.md](docs/项目说明.md)。
 
 ## 已知限制
 
@@ -73,6 +92,5 @@ crawl-flow/
 2. **并发抓取 / 全局限速 / 代理池**：单线程串行请求，无速率控制、无代理。
 3. **内容指纹去重**：只保证 `(source, external_id)` 唯一，不做正文指纹。
 4. **重试退避 / 死信队列 / 失败重放**：仅对连接级传输异常做一次立即重试，5xx 不重试，失败只留档不自动重放。
-5. **清洗规则 DSL / 字段质量校验**：清洗逻辑固定在代码中，不做可配置 DSL 与质量评分。
-6. **任务编排 / 定时调度 / 指标暴露**：只能手动执行 CLI，无调度器与监控指标。
-7. **浏览器渲染（Playwright）**：只抓取静态 HTTP 响应，不执行 JavaScript。
+5. **任务编排 / 定时调度 / 指标暴露**：只能手动执行 CLI，无调度器与监控指标。
+6. **浏览器渲染（Playwright）**：只抓取静态 HTTP 响应，不执行 JavaScript。
