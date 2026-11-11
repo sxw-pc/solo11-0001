@@ -1,0 +1,33 @@
+# 内容指纹与去重模块配置
+#
+# 任意规则变化都会改变生效版本号并触发历史指纹的批量重算；
+# 也可显式修改 rule_version 做版本标记（可选）。
+
+# rule_version: "v1"          # 显式规则版本，省略时按规则内容自动计算
+
+# 正文归一化后短于该字符数时跳过指纹计算（不生成无效指纹）
+min_content_length: 20
+
+# 参与指纹的字段
+fields:
+  title: true                 # 标题参与精确指纹与相似指纹
+  content: true               # 正文参与精确指纹与相似指纹
+
+# 指纹前文本归一化规则（逐项可开关）
+normalization:
+  nfkc: true                  # 全角→半角、兼容字符归一（中文排版差异免疫）
+  lowercase: true             # 拉丁字母统一小写
+  remove_whitespace: true     # 去除全部空白字符
+  remove_punctuation: true    # 去除标点符号
+
+# 精确指纹：完全相同（归一化后）的内容必然得到相同指纹
+exact:
+  algorithm: sha256           # sha256 / sha1 / md5 / blake2b
+
+# 相似指纹：SimHash + 中文按字符 n-gram，纯本地计算，无需预训练模型
+similarity:
+  enabled: true
+  bits: 64                    # SimHash 位数（16–128 之间 8 的倍数）
+  threshold: 0.9              # 相似度 ≥ 阈值 → 标记为相似内容；低于阈值不标记
+  cjk_ngram: 2                # 中文特征取字符 bigram
+  title_weight: 3             # 标题特征权重（正文特征权重为 1）

@@ -1,4 +1,4 @@
-"""Typer 命令行入口：run / db stats / serve-mock。"""
+"""Typer 命令行入口：run / db stats / dedup / serve-mock。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Optional
 import typer
 
 from crawl_flow.config import load_sources, select_sources
+from crawl_flow.dedup import DedupConfig, DedupService, DedupStore, load_dedup_config
 from crawl_flow.errors import ConfigError, FetchError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
@@ -17,6 +18,7 @@ from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
 
 DEFAULT_CONFIG = Path("config/sources.yaml")
+DEFAULT_DEDUP_CONFIG = Path("config/dedup.yaml")
 DEFAULT_DB = Path("data/crawl.db")
 DEFAULT_RAW_DIR = Path("data/raw")
 
@@ -27,6 +29,8 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="数据库运维命令", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+dedup_app = typer.Typer(help="内容指纹与去重（只标记，不改动原始数据）", no_args_is_help=True)
+app.add_typer(dedup_app, name="dedup")
 
 
 @app.command("run")
@@ -114,6 +118,112 @@ def db_stats(
         f"{'TOTAL':<24}{totals['records']:>8}{totals['raw_ok']:>8}"
         f"{totals['raw_failed']:>12}"
     )
+
+
+def _load_dedup_rules(config: Path) -> "DedupConfig":
+    """加载去重规则；默认路径不存在时退回内置默认规则。"""
+
+    if not config.exists() and config == DEFAULT_DEDUP_CONFIG:
+        return DedupConfig()
+    return load_dedup_config(config)
+
+
+def _open_dedup_store(db_path: Path) -> DedupStore:
+    if not db_path.exists():
+        typer.secho(f"数据库不存在: {db_path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    store = DedupStore(db_path)
+    store.init()
+    return store
+
+
+@dedup_app.command("run")
+def dedup_run(
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="只处理指定源的新增/变更记录"),
+    force: bool = typer.Option(False, "--force", help="强制重算全部历史指纹"),
+    config: Path = typer.Option(DEFAULT_DEDUP_CONFIG, "--config", help="去重规则配置文件路径"),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
+) -> None:
+    """计算内容指纹并重建重复/相似标记（只标记，不删除原始数据）。"""
+
+    logger = configure_logging(verbose)
+    try:
+        rules = _load_dedup_rules(config)
+    except ConfigError as exc:
+        typer.secho(f"配置错误: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    store = _open_dedup_store(db_path)
+    try:
+        summary = DedupService(store, rules).run(source=source, force=force, logger=logger)
+    except StoreError as exc:
+        typer.secho(f"去重失败: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    finally:
+        store.close()
+
+    typer.echo(
+        f"去重完成 rule_version={summary.rule_version} "
+        f"scanned={summary.scanned} computed={summary.computed} "
+        f"reused={summary.reused} skipped_short={summary.skipped_short} "
+        f"pruned={summary.pruned} elapsed_ms={summary.elapsed_ms}"
+    )
+    typer.echo(f"重复组 groups={summary.groups} 被标记记录 marked={summary.marked}（仅标记，未改动原始数据）")
+
+
+@dedup_app.command("stats")
+def dedup_stats(
+    db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
+) -> None:
+    """查看指纹与去重标记统计。"""
+
+    configure_logging(verbose)
+    store = _open_dedup_store(db_path)
+    try:
+        stats = store.stats()
+    finally:
+        store.close()
+
+    typer.echo(f"fingerprints={stats['fingerprints']}")
+    for version, count in sorted(stats["fingerprint_versions"].items()):
+        typer.echo(f"  rule_version={version} count={count}")
+    typer.echo(f"groups={stats['groups']} marked_records={stats['marked_records']}")
+    for match_type, count in sorted(stats["groups_by_type"].items()):
+        typer.echo(f"  match_type={match_type} groups={count}")
+
+
+@dedup_app.command("groups")
+def dedup_groups(
+    limit: int = typer.Option(20, "--limit", min=1, help="最多展示多少个重复组"),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
+) -> None:
+    """列出重复/相似内容组及其关联的来源与条目标识。"""
+
+    configure_logging(verbose)
+    store = _open_dedup_store(db_path)
+    try:
+        groups = store.list_groups(limit=limit)
+        members = {group.id: store.list_members(group.id) for group in groups}
+    finally:
+        store.close()
+
+    if not groups:
+        typer.echo("暂无重复内容标记")
+        return
+    for group in groups:
+        typer.echo(
+            f"group={group.group_key} match_type={group.match_type} "
+            f"members={group.member_count}"
+        )
+        for member in members[group.id]:
+            flag = "*" if member.is_representative else " "
+            typer.echo(
+                f"  {flag} source={member.source} external_id={member.external_id} "
+                f"similarity={member.similarity:.4f}"
+            )
 
 
 @app.command("serve-mock")
