@@ -1,16 +1,20 @@
-"""httpx 封装：统一超时、User-Agent 与一次固定重试。"""
+"""httpx 封装：统一超时、User-Agent、一次固定重试与响应体解码链。"""
 
 from __future__ import annotations
 
+import logging
 import time
 
 import httpx
 
 from crawl_flow.errors import FetchError
+from crawl_flow.fetch.encoding import decode_body
 from crawl_flow.fetch.types import FetchResult
 
 DEFAULT_USER_AGENT = "crawl-flow/0.1 (+https://example.invalid/crawl-flow)"
 DEFAULT_TIMEOUT_SECONDS = 10.0
+
+LOGGER = logging.getLogger("crawl_flow.fetch")
 
 
 class Fetcher:
@@ -51,11 +55,23 @@ class Fetcher:
                     url=url,
                 ) from exc
             elapsed_ms = int((time.perf_counter() - started) * 1000)
+            decoded = decode_body(response.content, response.headers)
+            LOGGER.debug(
+                "fetch url=%s status=%d encoding=%s encoding_source=%s elapsed_ms=%d",
+                response.url,
+                response.status_code,
+                decoded.encoding,
+                decoded.source,
+                elapsed_ms,
+            )
             return FetchResult(
                 url=str(response.url),
                 status_code=response.status_code,
                 headers=dict(response.headers),
-                body=response.text,
+                body=decoded.text,
+                content=response.content,
+                encoding=decoded.encoding,
+                encoding_source=decoded.source,
                 elapsed_ms=elapsed_ms,
             )
         raise FetchError(f"请求失败 url={url} error={last_error}", url=url)

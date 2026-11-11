@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
 from dataclasses import dataclass, field
@@ -271,7 +272,9 @@ def _success_payload(
         "status": result.status_code,
         "fetched_at": fetched_at.isoformat(),
         "headers": result.headers,
-        "body": result.body,
+        "encoding": result.encoding or None,
+        "encoding_source": result.encoding_source or None,
+        "body_base64": _encode_body(result),
     }
 
 
@@ -289,6 +292,14 @@ def _failure_payload(
         "status": result.status_code if result is not None else None,
         "fetched_at": fetched_at.isoformat(),
         "headers": result.headers if result is not None else {},
-        "body": result.body if result is not None else "",
+        "encoding": (result.encoding or None) if result is not None else None,
+        "encoding_source": (result.encoding_source or None) if result is not None else None,
+        "body_base64": _encode_body(result) if result is not None else "",
         "error": error,
     }
+
+
+def _encode_body(result: FetchResult) -> str:
+    """原始响应字节按 base64 留档，不做任何转码。"""
+
+    return base64.b64encode(result.raw_content).decode("ascii")
