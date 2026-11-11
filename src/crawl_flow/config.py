@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -11,11 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from crawl_flow.errors import ConfigError
 
 SourceType = Literal["api", "html"]
+RuleType = Literal["word", "regex"]
+WatchField = Literal["title", "content", "category", "tags"]
 
 DEFAULT_PATHS: dict[str, tuple[str, str]] = {
     "api": ("/api/items", "/api/items/{id}"),
     "html": ("/list", "/item/{id}"),
 }
+
+DEFAULT_WATCH_FIELDS: tuple[str, ...] = ("title", "content")
 
 
 class FieldMapping(BaseModel):
@@ -29,6 +34,56 @@ class FieldMapping(BaseModel):
     published_at: str = "published_at"
     content: str = "content"
     url: str | None = None
+
+
+class WatchRule(BaseModel):
+    """单条布控规则：普通词（word，默认大小写不敏感）或正则（regex）。
+
+    实例化时立即编译 pattern，非法正则在配置加载阶段就抛错，
+    不会等到采集运行到一半才暴露。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=128)
+    type: RuleType = "word"
+    pattern: str = Field(min_length=1, max_length=1024)
+    ignore_case: bool | None = None
+    fields: list[WatchField] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _compile_pattern(self) -> "WatchRule":
+        ignore_case = self.ignore_case if self.ignore_case is not None else self.type == "word"
+        flags = re.IGNORECASE if ignore_case else 0
+        raw_pattern = self.pattern if self.type == "regex" else re.escape(self.pattern)
+        try:
+            re.compile(raw_pattern, flags)
+        except re.error as exc:
+            raise ValueError(f"布控规则 {self.name!r} 正则非法: {exc}") from exc
+        return self
+
+    def effective_ignore_case(self) -> bool:
+        """word 默认不区分大小写；regex 默认区分，可被 ignore_case 覆盖。"""
+
+        return self.ignore_case if self.ignore_case is not None else self.type == "word"
+
+
+class WatchRuleSet(BaseModel):
+    """一组布控规则；源级配置只允许声明 rules。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rules: list[WatchRule] = Field(default_factory=list)
+
+
+class WatchSettings(WatchRuleSet):
+    """全局布控设置：规则列表 + 引擎参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    context_chars: int = Field(default=40, ge=1, le=1000)
+    timeout_seconds: float = Field(default=1.0, gt=0, le=30.0)
 
 
 class SourceConfig(BaseModel):
@@ -45,6 +100,7 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    watch: WatchRuleSet | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -65,9 +121,38 @@ class SourceConfig(BaseModel):
         return self
 
 
-def load_sources(path: str | Path) -> list[SourceConfig]:
-    """读取并校验源配置，任何问题统一抛 :class:`ConfigError`。"""
+class AppConfig(BaseModel):
+    """整份应用配置：源列表 + 全局布控设置。"""
 
+    model_config = ConfigDict(extra="forbid")
+
+    sources: list[SourceConfig] = Field(min_length=1)
+    watch: WatchSettings = Field(default_factory=WatchSettings)
+
+    @model_validator(mode="after")
+    def _unique_watch_rule_names(self) -> "AppConfig":
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+
+        def _check(rules: list[WatchRule], scope: str) -> None:
+            for rule in rules:
+                previous = seen.get(rule.name)
+                if previous is not None:
+                    if rule.name not in duplicates:
+                        duplicates.append(rule.name)
+                else:
+                    seen[rule.name] = scope
+
+        _check(self.watch.rules, "全局")
+        for source in self.sources:
+            if source.watch is not None:
+                _check(source.watch.rules, f"源 {source.name}")
+        if duplicates:
+            raise ValueError(f"布控规则名称重复（规则名需全局唯一）: {', '.join(duplicates)}")
+        return self
+
+
+def _read_yaml(path: str | Path) -> dict:
     config_path = Path(path)
     if not config_path.is_file():
         raise ConfigError(f"配置文件不存在: {config_path}")
@@ -83,19 +168,33 @@ def load_sources(path: str | Path) -> list[SourceConfig]:
     raw_sources = payload["sources"]
     if not isinstance(raw_sources, list) or not raw_sources:
         raise ConfigError("sources 必须是非空列表")
+    return payload
 
-    sources: list[SourceConfig] = []
-    for index, item in enumerate(raw_sources, start=1):
-        try:
-            sources.append(SourceConfig.model_validate(item))
-        except ValidationError as exc:
-            raise ConfigError(f"sources[{index}] 校验失败: {exc}") from exc
 
-    names = [source.name for source in sources]
+def load_app_config(path: str | Path) -> AppConfig:
+    """读取并校验整份配置（源 + 布控规则）。
+
+    正则规则在此阶段编译，非法规则、未知字段、规则名重复都会抛
+    :class:`ConfigError`，保证启动即失败。
+    """
+
+    payload = _read_yaml(path)
+    try:
+        config = AppConfig.model_validate(payload)
+    except ValidationError as exc:
+        raise ConfigError(f"配置校验失败: {exc}") from exc
+
+    names = [source.name for source in config.sources]
     duplicates = sorted({name for name in names if names.count(name) > 1})
     if duplicates:
         raise ConfigError(f"源名称重复: {', '.join(duplicates)}")
-    return sources
+    return config
+
+
+def load_sources(path: str | Path) -> list[SourceConfig]:
+    """读取并校验源配置，任何问题统一抛 :class:`ConfigError`。"""
+
+    return load_app_config(path).sources
 
 
 def select_sources(

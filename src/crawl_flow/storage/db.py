@@ -12,7 +12,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
-from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+from crawl_flow.models import (
+    Base,
+    RawRecord,
+    RawRecordRow,
+    Record,
+    RecordRow,
+    WatchHit,
+    WatchHitRow,
+)
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -114,6 +122,85 @@ class Database:
             statement = select(func.count()).select_from(RecordRow)
             if source is not None:
                 statement = statement.where(RecordRow.source == source)
+            return int(session.execute(statement).scalar_one())
+
+    def insert_watch_hit(self, hit: WatchHit) -> bool:
+        """写入一条布控命中；唯一键冲突时忽略并返回 ``False``（首次命中返回 ``True``）。"""
+
+        values = {
+            "source": hit.source,
+            "external_id": hit.external_id,
+            "rule_name": hit.rule_name,
+            "field": hit.field,
+            "rule_type": hit.rule_type,
+            "matched": hit.matched,
+            "context": hit.context,
+            "hit_at": hit.hit_at,
+        }
+        try:
+            with self._session_factory() as session:
+                statement = sqlite_insert(WatchHitRow).values(**values)
+                statement = statement.on_conflict_do_nothing(
+                    index_elements=["source", "external_id", "rule_name", "field"]
+                )
+                result = session.execute(statement)
+                session.commit()
+                return bool(result.rowcount)
+        except SQLAlchemyError as exc:
+            raise StoreError(
+                f"watch_hits 写入失败 source={hit.source} "
+                f"external_id={hit.external_id} rule={hit.rule_name} error={exc}"
+            ) from exc
+
+    def query_watch_hits(
+        self,
+        *,
+        source: str | None = None,
+        rule_name: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[WatchHitRow]:
+        """按源 / 规则 / 命中时间范围翻查命中清单，按命中时间倒序返回。"""
+
+        with Session(self.engine) as session:
+            statement = select(WatchHitRow)
+            if source is not None:
+                statement = statement.where(WatchHitRow.source == source)
+            if rule_name is not None:
+                statement = statement.where(WatchHitRow.rule_name == rule_name)
+            if start is not None:
+                statement = statement.where(WatchHitRow.hit_at >= start)
+            if end is not None:
+                statement = statement.where(WatchHitRow.hit_at <= end)
+            statement = (
+                statement.order_by(WatchHitRow.hit_at.desc(), WatchHitRow.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def count_watch_hits(
+        self,
+        *,
+        source: str | None = None,
+        rule_name: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> int:
+        """与 :meth:`query_watch_hits` 同条件的总数，用于分页展示。"""
+
+        with Session(self.engine) as session:
+            statement = select(func.count()).select_from(WatchHitRow)
+            if source is not None:
+                statement = statement.where(WatchHitRow.source == source)
+            if rule_name is not None:
+                statement = statement.where(WatchHitRow.rule_name == rule_name)
+            if start is not None:
+                statement = statement.where(WatchHitRow.hit_at >= start)
+            if end is not None:
+                statement = statement.where(WatchHitRow.hit_at <= end)
             return int(session.execute(statement).scalar_one())
 
     def count_raw(self, source: str | None = None, status: str | None = None) -> int:

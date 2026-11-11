@@ -1,5 +1,32 @@
 # crawl-flow 源配置
 # 每个源必须包含 name / type / base_url；page_size 只对 api 类型生效。
+#
+# 顶层 watch 段为全局布控配置：
+#   enabled         总开关，false 时整轮不执行任何布控规则
+#   context_chars   命中位置前后各截取的字符数（默认 40）
+#   timeout_seconds 单条正则执行的硬超时（默认 1 秒，超时熔断该规则）
+#   rules           全局规则，对所有源生效
+# 规则字段：
+#   name        规则名，全局唯一，命中表与 CLI 过滤都用它
+#   type        word（普通词，默认大小写不敏感）或 regex（正则，默认区分大小写）
+#   pattern     词面量或正则表达式；regex 在启动时编译，非法直接报错退出
+#   ignore_case 可选，覆盖默认的大小写策略
+#   fields      可选，限定扫描字段：title/content/category/tags，默认 title+content
+# 源级规则写在每个源的 watch.rules 下，只对该源生效，与全局规则叠加。
+watch:
+  enabled: true
+  context_chars: 40
+  timeout_seconds: 1.0
+  rules:
+    # 普通词：默认不区分大小写，命中标题或正文里的「数据库」
+    - name: brand_database
+      type: word
+      pattern: 数据库
+    # 正则：匹配「地铁」后面间隔不超过 6 个字符再出现「客流」
+    - name: metro_flow_regex
+      type: regex
+      pattern: 地铁.{0,6}客流
+
 sources:
   - name: demo_api
     type: api
@@ -17,6 +44,13 @@ sources:
       published_at: published_at
       content: content
       url: null
+    # 源级规则：只布控 demo_api，扫描标签字段
+    watch:
+      rules:
+        - name: api_tag_library
+          type: word
+          pattern: 图书馆
+          fields: [tags]
 
   - name: demo_html
     type: html

@@ -1,4 +1,4 @@
-"""采集主流程：列表翻页 → 详情抓取 → 解析 → 归一化 → 落 raw → 入库。"""
+"""采集主流程：列表翻页 → 详情抓取 → 解析 → 归一化 → 布控 → 落 raw → 入库。"""
 
 from __future__ import annotations
 
@@ -9,15 +9,17 @@ from datetime import datetime, timezone
 from typing import Any
 
 from crawl_flow.config import SourceConfig
-from crawl_flow.errors import FetchError, ParseError
+from crawl_flow.errors import FetchError, ParseError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
-from crawl_flow.models import RawRecord
+from crawl_flow.models import RawRecord, Record, WatchHit
 from crawl_flow.observability.logging import log_item
 from crawl_flow.pipeline.normalize import normalize_record
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
+from crawl_flow.watch import WatchEngine
+from crawl_flow.watch.engine import RuleHit
 
 LOGGER_NAME = "crawl_flow.pipeline"
 MAX_ERROR_LENGTH = 500
@@ -53,12 +55,14 @@ def run_source(
     fetcher: Fetcher | None = None,
     limit: int | None = None,
     dry_run: bool = False,
+    watch_engine: WatchEngine | None = None,
     logger: logging.Logger | None = None,
 ) -> RunSummary:
     """采集一个源。
 
     列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
+    ``watch_engine`` 为该源启用关键词布控；为 ``None`` 时跳过布控。
     """
 
     log = logger or logging.getLogger(LOGGER_NAME)
@@ -89,6 +93,7 @@ def run_source(
                     db=db,
                     raw_store=raw_store,
                     dry_run=dry_run,
+                    watch_engine=watch_engine,
                     logger=log,
                 )
                 summary.results.append(outcome)
@@ -121,6 +126,7 @@ def process_item(
     raw_store: RawStore,
     dry_run: bool,
     logger: logging.Logger,
+    watch_engine: WatchEngine | None = None,
 ) -> ItemOutcome:
     """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。"""
 
@@ -183,6 +189,9 @@ def process_item(
             result=result,
         )
 
+    # 归一化完成、写入存储前先过布控引擎；命中结果待条目入库后再落 watch_hits。
+    watch_hits = _scan_watch(watch_engine, record, logger=logger)
+
     if not dry_run:
         raw_path = raw_store.save(
             source=source.name,
@@ -203,10 +212,86 @@ def process_item(
             )
         )
         db.upsert_record(record)
+        _persist_watch_hits(
+            db,
+            record=record,
+            hits=watch_hits,
+            hit_at=fetched_at,
+            logger=logger,
+        )
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_item(logger, source.name, item.external_id, "ok", elapsed_ms)
     return ItemOutcome(external_id=item.external_id, status="ok", elapsed_ms=elapsed_ms)
+
+
+def _scan_watch(
+    watch_engine: WatchEngine | None,
+    record: Record,
+    *,
+    logger: logging.Logger,
+) -> list[RuleHit]:
+    """对归一化记录执行布控扫描。
+
+    引擎内部已隔离单规则异常；这里再包一层兜底，保证布控自身的任何意外
+    都只记日志，绝不让条目入库失败。
+    """
+
+    if watch_engine is None:
+        return []
+    try:
+        return watch_engine.scan_record(record)
+    except Exception as exc:  # noqa: BLE001 - 布控是旁路能力，不能拖垮主链路
+        logger.warning(
+            "布控引擎异常，跳过本条布控 source=%s external_id=%s error=%s",
+            record.source,
+            record.external_id,
+            exc,
+        )
+        return []
+
+
+def _persist_watch_hits(
+    db: Database,
+    *,
+    record: Record,
+    hits: list[RuleHit],
+    hit_at: datetime,
+    logger: logging.Logger,
+) -> None:
+    """把命中写入独立的 watch_hits 表；写入失败不影响条目入库结果。"""
+
+    for hit in hits:
+        watch_hit = WatchHit(
+            source=record.source,
+            external_id=record.external_id,
+            rule_name=hit.rule_name,
+            field=hit.field,
+            rule_type=hit.rule_type,
+            matched=hit.matched,
+            context=hit.context,
+            hit_at=hit_at,
+        )
+        try:
+            inserted = db.insert_watch_hit(watch_hit)
+        except StoreError as exc:
+            logger.warning(
+                "布控命中写入失败，跳过 source=%s external_id=%s rule=%s error=%s",
+                record.source,
+                record.external_id,
+                hit.rule_name,
+                exc,
+            )
+            continue
+        if inserted:
+            logger.info(
+                "watch hit source=%s external_id=%s rule=%s field=%s matched=%r",
+                record.source,
+                record.external_id,
+                hit.rule_name,
+                hit.field,
+                hit.matched,
+            )
 
 
 def _fail(

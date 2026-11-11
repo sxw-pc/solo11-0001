@@ -37,3 +37,18 @@ class ParseError(CrawlFlowError):
 
 class StoreError(CrawlFlowError):
     """原始响应落盘或数据库写入失败。"""
+
+
+class WatchError(CrawlFlowError):
+    """布控模块的可预期错误（配置非法等）。"""
+
+
+class WatchRegexTimeout(WatchError):
+    """正则执行超过布控引擎配置的超时时间。"""
+
+    def __init__(self, rule_name: str, timeout_seconds: float) -> None:
+        super().__init__(
+            f"正则执行超时 rule={rule_name} timeout_seconds={timeout_seconds}"
+        )
+        self.rule_name = rule_name
+        self.timeout_seconds = timeout_seconds

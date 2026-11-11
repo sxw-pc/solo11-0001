@@ -59,6 +59,21 @@ class RawRecord(BaseModel):
         return trimmed or None
 
 
+class WatchHit(BaseModel):
+    """一次布控命中，对应 ``watch_hits`` 表。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(min_length=1)
+    external_id: str = Field(min_length=1)
+    rule_name: str = Field(min_length=1)
+    field: str = Field(min_length=1)
+    rule_type: str = Field(min_length=1)
+    matched: str = ""
+    context: str = ""
+    hit_at: datetime
+
+
 class Base(DeclarativeBase):
     """SQLAlchemy 声明式基类。"""
 
@@ -103,3 +118,34 @@ class RecordRow(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class WatchHitRow(Base):
+    """``watch_hits``：布控命中明细。
+
+    唯一键 ``(source, external_id, rule_name, field)`` 保证同一条内容、
+    同一条规则在同一个字段上的重复采集只保留首次命中（重扫不堆积重复行）。
+    """
+
+    __tablename__ = "watch_hits"
+    __table_args__ = (
+        UniqueConstraint(
+            "source",
+            "external_id",
+            "rule_name",
+            "field",
+            name="uq_watch_hits_source_item_rule_field",
+        ),
+        Index("ix_watch_hits_source_rule", "source", "rule_name"),
+        Index("ix_watch_hits_hit_at", "hit_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    rule_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    field: Mapped[str] = mapped_column(String(32), nullable=False)
+    rule_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    matched: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    context: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    hit_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
