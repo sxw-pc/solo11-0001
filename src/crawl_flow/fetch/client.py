@@ -7,6 +7,7 @@ import time
 import httpx
 
 from crawl_flow.errors import FetchError
+from crawl_flow.fetch.encoding import decode_body
 from crawl_flow.fetch.types import FetchResult
 
 DEFAULT_USER_AGENT = "crawl-flow/0.1 (+https://example.invalid/crawl-flow)"
@@ -51,11 +52,16 @@ class Fetcher:
                     url=url,
                 ) from exc
             elapsed_ms = int((time.perf_counter() - started) * 1000)
+            content = response.content
+            decoded = decode_body(content, response.headers.get("content-type", ""))
             return FetchResult(
                 url=str(response.url),
                 status_code=response.status_code,
                 headers=dict(response.headers),
-                body=response.text,
+                body=decoded.text,
+                content=content,
+                encoding=decoded.encoding,
+                encoding_source=decoded.source,
                 elapsed_ms=elapsed_ms,
             )
         raise FetchError(f"请求失败 url={url} error={last_error}", url=url)

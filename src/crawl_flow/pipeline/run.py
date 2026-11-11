@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
 from dataclasses import dataclass, field
@@ -144,6 +145,14 @@ def process_item(
             fetched_at=fetched_at,
         )
 
+    logger.debug(
+        "detail decoded source=%s external_id=%s encoding=%s encoding_source=%s",
+        source.name,
+        item.external_id,
+        result.encoding or "-",
+        result.encoding_source or "-",
+    )
+
     if result.status_code >= 400:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return _fail(
@@ -271,7 +280,7 @@ def _success_payload(
         "status": result.status_code,
         "fetched_at": fetched_at.isoformat(),
         "headers": result.headers,
-        "body": result.body,
+        **_archive_fields(result),
     }
 
 
@@ -289,6 +298,22 @@ def _failure_payload(
         "status": result.status_code if result is not None else None,
         "fetched_at": fetched_at.isoformat(),
         "headers": result.headers if result is not None else {},
-        "body": result.body if result is not None else "",
+        **_archive_fields(result),
         "error": error,
+    }
+
+
+def _archive_fields(result: FetchResult | None) -> dict[str, Any]:
+    """原始响应留档：原始字节 base64 原样保存，不做任何转码。
+
+    ``encoding`` / ``encoding_source`` 只描述解析时如何解码，供事后核对，
+    不会改变留档字节本身。
+    """
+
+    if result is None:
+        return {"encoding": "", "encoding_source": "", "body_b64": ""}
+    return {
+        "encoding": result.encoding,
+        "encoding_source": result.encoding_source,
+        "body_b64": base64.b64encode(result.content).decode("ascii"),
     }

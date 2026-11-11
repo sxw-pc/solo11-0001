@@ -70,7 +70,13 @@ class DemoHtmlAdapter(SourceAdapter):
         }
 
     def _soup(self, result: FetchResult) -> BeautifulSoup:
-        return BeautifulSoup(result.body, "lxml")
+        text = result.body
+        soup = BeautifulSoup(text, "lxml")
+        if text.strip() and soup.find() is None:
+            # lxml 对个别畸形文档会产出空树；换内置解析器再试一次。
+            # 非致命语法错误不应直接判失败——能提取必填字段就照常处理。
+            soup = BeautifulSoup(text, "html.parser")
+        return soup
 
     @staticmethod
     def _text_or_none(soup: BeautifulSoup, selector: str) -> str | None:

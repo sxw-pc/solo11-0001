@@ -34,6 +34,25 @@ sources:
       content: content
       url: null
 
+  # 编码 / 畸形页面演练源：GBK、GB2312、UTF-8 BOM、响应头声明错误、
+  # 未闭合标签、缺少必填选择器与完全不可解析页面。
+  # 默认 disabled，可显式 `--source demo_legacy` 运行。
+  - name: demo_legacy
+    type: html
+    base_url: http://127.0.0.1:8010
+    enabled: false
+    page_size: 5
+    timeout_seconds: 10
+    list_path: /legacy/list
+    detail_path: /legacy/item/{id}
+    field_map:
+      title: title
+      category: category
+      tags: tags
+      published_at: published_at
+      content: content
+      url: null
+
   # 故障演练源：详情一律返回 500，用来验证错误隔离。
   # 默认 disabled，--all 不会带上；可显式 `--source demo_api_flaky` 运行。
   - name: demo_api_flaky
