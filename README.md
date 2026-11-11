@@ -52,6 +52,36 @@ crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
 crawl-flow db stats --db data/crawl.db
 ```
 
+## 适配器自动生成与适配校验（autogen）
+
+只需要**入口地址 + 必填字段**，即可自动爬取样本、识别分页/列表/详情结构，
+生成可直接被本管道加载的声明式适配器（`auto_html` 类型，无需改核心代码），
+并支持定期校验、漂移告警与可落地的调整建议。
+
+```bash
+# 起公开静态博客 mock（v1 正常结构；--variant v2 可模拟站点改版）
+crawl-flow autogen serve-blog --port 8020
+
+# 自动生成适配器（默认每 2 秒至多 1 次请求；动态渲染默认关闭）
+crawl-flow autogen generate http://127.0.0.1:8020/posts \
+  --field title --field content --field published_at --field category --field tags \
+  --output config/generated --sample-root data/autogen_samples
+
+# 把生成的源接入管道即可直接采集（输出与手写适配器完全一致）
+crawl-flow run --source 127_0_0_1_8020 --config config/generated/127_0_0_1_8020.source.yaml
+
+# 用最新站点样本校验适配器，结构漂移时给出新旧选择器对照建议
+crawl-flow autogen validate config/generated/127_0_0_1_8020.spec.json
+
+# 周期校验（默认 1 小时；--once 可交给外部 cron / CronJob 接管）
+crawl-flow autogen validate-schedule config/generated/127_0_0_1_8020.spec.json --once
+```
+
+内置约束：请求间隔默认 ≥ 2s、样本仅保留最近 3 版且总量 ≤ 100MB（超出清理最早版本）、
+登录/验证码站点明确拒绝、动态渲染需显式 `--enable-dynamic-rendering`、
+恶意样本经沙箱拦截且运行期不执行任何站点脚本。设计细节见
+[docs/autogen模块设计.md](docs/autogen模块设计.md)。
+
 ## 目录速览
 
 ```

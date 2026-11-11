@@ -16,6 +16,11 @@ from crawl_flow.pipeline.run import RunSummary, run_source
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
 
+try:  # 自动生成子命令是可选能力，缺失依赖时不影响核心管道命令
+    from crawl_flow.autogen.cli import autogen_app
+except ImportError:  # pragma: no cover
+    autogen_app = None
+
 DEFAULT_CONFIG = Path("config/sources.yaml")
 DEFAULT_DB = Path("data/crawl.db")
 DEFAULT_RAW_DIR = Path("data/raw")
@@ -27,6 +32,8 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="数据库运维命令", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+if autogen_app is not None:
+    app.add_typer(autogen_app, name="autogen")
 
 
 @app.command("run")

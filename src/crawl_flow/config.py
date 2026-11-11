@@ -10,11 +10,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from crawl_flow.errors import ConfigError
 
-SourceType = Literal["api", "html"]
+SourceType = Literal["api", "html", "auto_html"]
 
 DEFAULT_PATHS: dict[str, tuple[str, str]] = {
     "api": ("/api/items", "/api/items/{id}"),
     "html": ("/list", "/item/{id}"),
+    # auto_html 的真实路径保存在 adapter_spec 内，这里仅给占位值满足校验。
+    "auto_html": ("/__auto_list__", "/__auto_detail__/{id}"),
 }
 
 
@@ -45,6 +47,8 @@ class SourceConfig(BaseModel):
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    # auto_html 类型专用：自动生成模块产出的声明式适配器规格（纯数据，无可执行代码）。
+    adapter_spec: dict[str, object] | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -55,6 +59,16 @@ class SourceConfig(BaseModel):
 
     @model_validator(mode="after")
     def _fill_paths(self) -> "SourceConfig":
+        if self.type == "auto_html":
+            if not self.adapter_spec:
+                raise ValueError("auto_html 类型必须提供 adapter_spec")
+            # 路径以 adapter_spec 为准，占位值不参与实际请求。
+            spec_paths = self.adapter_spec.get("list"), self.adapter_spec.get("detail")
+            list_spec, detail_spec = spec_paths
+            if isinstance(list_spec, dict) and isinstance(detail_spec, dict):
+                self.list_path = str(list_spec.get("list_path", ""))
+                self.detail_path = str(detail_spec.get("detail_path", ""))
+            return self
         list_default, detail_default = DEFAULT_PATHS[self.type]
         if self.list_path is None:
             self.list_path = list_default
