@@ -49,7 +49,10 @@ crawl-flow db stats
 ```bash
 crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库
 crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
-crawl-flow db stats --db data/crawl.db
+crawl-flow db stats --db data/crawl.db # 默认按源汇总（向后兼容）
+crawl-flow db stats --dim category      # 按分类维度统计（含失败 raw 占比）
+crawl-flow db stats --dim tag -s demo_api --start 2024-03-01 --end 2024-03-31
+crawl-flow db stats --dim tag -o data/report.csv  # 导出 CSV（utf-8-sig，防目录穿越）
 ```
 
 ## 目录速览

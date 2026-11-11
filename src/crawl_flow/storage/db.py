@@ -6,7 +6,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import (
+    Engine,
+    and_,
+    case,
+    func,
+    literal_column,
+    select,
+    true,
+)
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -26,6 +34,12 @@ RECORD_UPDATE_FIELDS = (
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+
+STATS_DIMENSIONS = ("category", "tag")
+"""``dimension_stats`` 支持的统计维度。"""
+
+UNCATEGORIZED_LABEL = "(未分类)"
+"""category 为 NULL 时在统计结果中使用的占位值。"""
 
 
 def _utcnow() -> datetime:
@@ -177,6 +191,147 @@ class Database:
             "raw_failed": sum(row["raw_failed"] for row in rows),
         }
         return {"sources": rows, "totals": totals}
+
+    def dimension_stats(
+        self,
+        dimension: str,
+        *,
+        sources: list[str] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> dict[str, Any]:
+        """按分类（category）或标签（tag）维度汇总 records。
+
+        每条结果包含：维度值、记录总数、最近更新时间、关联 raw 总数与
+        失败 raw 占比。``category`` 为 NULL 的记录归入
+        :data:`UNCATEGORIZED_LABEL`；标签为空数组的记录不进入任何标签
+        桶。``sources`` / ``start`` / ``end`` 均基于 records 表过滤，
+        关联失败数通过 ``(source, external_id)`` 连接 raw_records 统计。
+        """
+
+        if dimension not in STATS_DIMENSIONS:
+            raise ValueError(
+                f"不支持的统计维度: {dimension}，可选值: {', '.join(STATS_DIMENSIONS)}"
+            )
+        if start is not None and end is not None and start > end:
+            raise ValueError("时间区间起点不能晚于终点")
+
+        record_filters = self._record_filters(sources, start, end)
+        raw_join = and_(
+            RawRecordRow.source == RecordRow.source,
+            RawRecordRow.external_id == RecordRow.external_id,
+        )
+        failed_flag = case((RawRecordRow.status == "failed", 1), else_=0)
+
+        try:
+            with Session(self.engine) as session:
+                if dimension == "category":
+                    value_expr = func.coalesce(RecordRow.category, UNCATEGORIZED_LABEL)
+                    aggregated_rows = session.execute(
+                        select(
+                            value_expr.label("dimension_value"),
+                            func.count().label("record_count"),
+                            func.max(RecordRow.updated_at).label("last_updated_at"),
+                            func.count(RawRecordRow.id).label("raw_total"),
+                            func.coalesce(func.sum(failed_flag), 0).label("raw_failed"),
+                        )
+                        .select_from(RecordRow)
+                        .outerjoin(RawRecordRow, raw_join)
+                        .where(*record_filters)
+                        .group_by(value_expr)
+                    ).all()
+                    overall_raw_total: int | None = None
+                    overall_raw_failed: int | None = None
+                else:
+                    tag_table = func.json_each(RecordRow.tags).table_valued(
+                        literal_column("value")
+                    )
+                    tag_value = tag_table.c.value
+                    aggregated_rows = session.execute(
+                        select(
+                            tag_value.label("dimension_value"),
+                            func.count().label("record_count"),
+                            func.max(RecordRow.updated_at).label("last_updated_at"),
+                            func.count(RawRecordRow.id).label("raw_total"),
+                            func.coalesce(func.sum(failed_flag), 0).label("raw_failed"),
+                        )
+                        .select_from(RecordRow)
+                        .join(tag_table, true())
+                        .outerjoin(RawRecordRow, raw_join)
+                        .where(*record_filters)
+                        .group_by(tag_value)
+                    ).all()
+                    # 标签会展开多份，整体口径按 distinct raw 行统计，避免重复计数
+                    overall = session.execute(
+                        select(
+                            func.count(func.distinct(RawRecordRow.id)),
+                            func.count(
+                                func.distinct(case((RawRecordRow.status == "failed", RawRecordRow.id)))
+                            ),
+                        )
+                        .select_from(RecordRow)
+                        .outerjoin(RawRecordRow, raw_join)
+                        .where(*record_filters)
+                    ).one()
+                    overall_raw_total = int(overall[0] or 0)
+                    overall_raw_failed = int(overall[1] or 0)
+        except SQLAlchemyError as exc:
+            raise StoreError(f"维度统计失败 dimension={dimension} error={exc}") from exc
+
+        rows: list[dict[str, Any]] = []
+        total_records = 0
+        total_failed_hits = 0
+        total_raw_hits = 0
+        for value, count, last_updated, raw_total, raw_failed in aggregated_rows:
+            count = int(count)
+            raw_total = int(raw_total or 0)
+            raw_failed = int(raw_failed or 0)
+            total_records += count
+            total_raw_hits += raw_total
+            total_failed_hits += raw_failed
+            rows.append(
+                {
+                    "dimension": dimension,
+                    "dimension_value": value,
+                    "record_count": count,
+                    "last_updated_at": last_updated,
+                    "raw_total": raw_total,
+                    "raw_failed": raw_failed,
+                    "raw_failed_ratio": (raw_failed / raw_total) if raw_total else 0.0,
+                }
+            )
+        rows.sort(key=lambda item: item["dimension_value"])
+
+        if dimension == "category":
+            # 一条记录只属于一个分类，桶内 raw 求和即整体 distinct 口径
+            overall_raw_total = total_raw_hits
+            overall_raw_failed = total_failed_hits
+        totals = {
+            "records": total_records,
+            "raw_total": int(overall_raw_total or 0),
+            "raw_failed": int(overall_raw_failed or 0),
+            "raw_failed_ratio": (
+                (overall_raw_failed / overall_raw_total)
+                if overall_raw_total
+                else 0.0
+            ),
+        }
+        return {"dimension": dimension, "rows": rows, "totals": totals}
+
+    @staticmethod
+    def _record_filters(
+        sources: list[str] | None,
+        start: datetime | None,
+        end: datetime | None,
+    ) -> list[Any]:
+        filters: list[Any] = []
+        if sources:
+            filters.append(RecordRow.source.in_(list(sources)))
+        if start is not None:
+            filters.append(RecordRow.fetched_at >= start)
+        if end is not None:
+            filters.append(RecordRow.fetched_at <= end)
+        return filters
 
     def close(self) -> None:
         self.engine.dispose()

@@ -21,6 +21,38 @@ def safe_external_id(external_id: str) -> str:
     return (candidate or "unknown")[:MAX_ID_LENGTH]
 
 
+# 路径分量中的路径分隔符、NUL 与 ``..`` 穿越片段；允许中文等 Unicode 字符。
+_UNSAFE_PATH_PART = re.compile(r"[\\/\x00]|(?:^|[^.])\.\.(?![.])")
+
+
+def safe_path_part(part: str) -> str:
+    """清洗单个路径分量：禁止分隔符、NUL 与 ``..``，保留中文等合法字符。"""
+
+    candidate = _UNSAFE_PATH_PART.sub("_", part)
+    cleaned = candidate.lstrip(".") or "_"
+    return cleaned[:255]
+
+
+def safe_output_path(path: str | Path) -> Path:
+    """把用户提供的导出路径规范化为安全路径，防止目录穿越。
+
+    与 :class:`RawStore` 落盘遵循同一套安全原则：路径分量逐个清洗，
+    ``..``、``/``、``\\``、NUL 等可用于穿越的字符替换为 ``_``，
+    前导 ``.`` 去除，空分量以 ``_`` 占位；绝对路径保留其根锚点，
+    相对路径相对当前工作目录解析，清洗结果不可能指向锚点之外。
+    与落盘文件名不同，导出路径允许中文等 Unicode 字符。
+    """
+
+    candidate = Path(path)
+    parts = [part for part in candidate.parts if part not in ("", "/", "\\")]
+    cleaned = [safe_path_part(part) for part in parts]
+    if not cleaned or all(not part.strip("._") for part in cleaned):
+        raise StoreError(f"非法导出路径: {path}")
+    if candidate.is_absolute():
+        return Path(candidate.anchor).joinpath(*cleaned)
+    return Path(*cleaned)
+
+
 class RawStore:
     """负责把原始响应写成 JSON 文件，不读取数据库。"""
 
