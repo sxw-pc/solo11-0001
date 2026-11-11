@@ -36,12 +36,13 @@ crawl-flow db stats
 
 同一源重复执行不会增加 `records` 行数，只会刷新 `updated_at`。
 
-## 三条核心命令
+## 核心命令
 
 | 用途 | 命令 |
 | --- | --- |
 | 起 mock 站点 | `crawl-flow serve-mock --port 8010` |
 | 跑一次采集 | `crawl-flow run --source demo_api --limit 5` / `crawl-flow run --all` |
+| 归档冷数据 | `crawl-flow archive --days 30 --source demo_api` |
 | 跑测试 | `pytest -q` |
 
 其他可用命令与参数：
@@ -50,20 +51,43 @@ crawl-flow db stats
 crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库
 crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
 crawl-flow db stats --db data/crawl.db
+crawl-flow archive --days 30 --source demo_api   # 超过 30 天的冷数据
+crawl-flow archive --days 30 --dry-run           # 只统计候选行
+crawl-flow archive --before 2026-01-01 --start 2025-01-01
 ```
+
+### 冷热分层（默认关闭）
+
+归档命令把超过 `--days` 天（或早于 `--before`）的结构化记录与 raw 元信息
+迁移到按月份分片的归档库 `data/archive/archive-YYYY-MM.db`，原始响应文件
+同步迁移到 `data/archive/raw/`。主库只保留热数据。
+
+- **默认不开启**：不执行 `archive` 就没有任何归档设置，`run` / `db stats`
+  与旧版本完全一致。
+- **自动跨库查询**：执行过一次归档后，设置写入主库；此后 `db stats` 与
+  `Database.query_records()` 会自动合并归档库，无需手动切换数据库。
+- **断点续传**：每个批次完成后推进 `archive_checkpoints` 游标；中断后重跑
+  从上次位置继续，不会丢失或重复归档。
+- **并发安全**：删除主库行前再次校验 `fetched_at` / `updated_at` 快照，
+  归档期间被重新采集的热数据不会被误迁移。
+- **完整性校验与回滚**：每批先写归档库并校验内容摘要与冷 raw 文件，校验
+  失败自动撤销本批迁移，主库保持原样。
+- **低锁表时间**：主库写事务仅包含批量 `DELETE` 与断点更新，默认批大小
+  100，实测单批锁表时间远低于 2 秒。
+
 
 ## 目录速览
 
 ```
 crawl-flow/
 ├── config/sources.yaml      # 源定义（demo_api / demo_html 等）
-├── src/crawl_flow/          # 管道实现（CLI、配置、适配器、存储）
+├── src/crawl_flow/          # 管道实现（CLI、配置、适配器、存储、归档）
 ├── mock_site/               # 本地 mock 站点与 fixtures
 ├── tests/                   # pytest 测试（自带随机端口 mock 服务）
 └── docs/项目说明.md         # 详细设计、数据模型与测试说明
 ```
 
-完整结构、F1–F8 功能拆解、数据表字段与关键流程见 [docs/项目说明.md](docs/项目说明.md)。
+完整结构、F1–F9 功能拆解、数据表字段与关键流程见 [docs/项目说明.md](docs/项目说明.md)。
 
 ## 已知限制
 

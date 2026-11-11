@@ -70,6 +70,7 @@ class RawRecordRow(Base):
     __table_args__ = (
         UniqueConstraint("source", "external_id", name="uq_raw_records_source_external"),
         Index("ix_raw_records_status", "status"),
+        Index("ix_raw_records_fetched_at", "fetched_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -90,6 +91,7 @@ class RecordRow(Base):
     __table_args__ = (
         UniqueConstraint("source", "external_id", name="uq_records_source_external"),
         Index("ix_records_source_category", "source", "category"),
+        Index("ix_records_fetched_at", "fetched_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -102,4 +104,39 @@ class RecordRow(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ArchiveSettingsRow(Base):
+    """``archive_settings``：归档开关与目录（单例行，存在即表示启用跨库查询）。"""
+
+    __tablename__ = "archive_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    archive_dir: Mapped[str] = mapped_column(String(1024), nullable=False)
+    cold_raw_dir: Mapped[str] = mapped_column(String(1024), nullable=False)
+    retention_days: Mapped[int] = mapped_column(Integer, nullable=False, default=90)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ArchiveCheckpointRow(Base):
+    """``archive_checkpoints``：每个 (scope, 归档目录) 的断点续传游标。"""
+
+    __tablename__ = "archive_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("scope", "archive_dir", name="uq_archive_checkpoints_scope_dir"),
+        Index("ix_archive_checkpoints_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope: Mapped[str] = mapped_column(String(128), nullable=False)
+    archive_dir: Mapped[str] = mapped_column(String(1024), nullable=False)
+    cutoff: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    cursor_records: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cursor_raw: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    archived_records: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    archived_raw: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

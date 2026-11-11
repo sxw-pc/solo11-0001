@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -13,12 +14,15 @@ from crawl_flow.errors import ConfigError, FetchError, StoreError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.observability.logging import configure_logging
 from crawl_flow.pipeline.run import RunSummary, run_source
+from crawl_flow.storage.archive import archive_cold_data
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
 
 DEFAULT_CONFIG = Path("config/sources.yaml")
 DEFAULT_DB = Path("data/crawl.db")
 DEFAULT_RAW_DIR = Path("data/raw")
+DEFAULT_ARCHIVE_DIR = Path("data/archive")
+DEFAULT_RETENTION_DAYS = 90
 
 app = typer.Typer(
     add_completion=False,
@@ -83,19 +87,25 @@ def run_command(
 @db_app.command("stats")
 def db_stats(
     db_path: Path = typer.Option(DEFAULT_DB, "--db", help="SQLite 数据库路径"),
+    archive_dir: Optional[Path] = typer.Option(
+        None, "--archive-dir", help="归档目录（默认自动读取主库中的归档设置）"
+    ),
+    hot_only: bool = typer.Option(
+        False, "--hot-only", help="只统计主库热数据，不合并归档库"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
 ) -> None:
-    """查看每个源的 records / raw 统计。"""
+    """查看每个源的 records / raw 统计（归档启用时自动合并归档库）。"""
 
     configure_logging(verbose)
     if not db_path.exists():
         typer.secho(f"数据库不存在: {db_path}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    database = Database(db_path)
+    database = Database(db_path, archive_dir=archive_dir)
     try:
         database.init()
-        stats = database.stats()
+        stats = database.stats(include_archive=not hot_only)
     except StoreError as exc:
         typer.secho(f"统计失败: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -114,6 +124,114 @@ def db_stats(
         f"{'TOTAL':<24}{totals['records']:>8}{totals['raw_ok']:>8}"
         f"{totals['raw_failed']:>12}"
     )
+    archive = stats["archive"]
+    if archive.get("enabled"):
+        typer.echo(
+            f"archive enabled dir={archive['archive_dir']} shards={archive['shards']} "
+            f"records={archive['records']} raw={archive['raw']}"
+        )
+
+
+@app.command("archive")
+def archive_command(
+    db_path: Path = typer.Option(DEFAULT_DB, "--db", help="主 SQLite 数据库路径"),
+    raw_dir: Path = typer.Option(DEFAULT_RAW_DIR, "--raw-dir", help="热原始响应目录"),
+    archive_dir: Path = typer.Option(
+        DEFAULT_ARCHIVE_DIR, "--archive-dir", help="归档库与冷 raw 目录"
+    ),
+    days: Optional[int] = typer.Option(
+        None, "--days", min=1, help=f"归档超过 N 天的数据（默认 {DEFAULT_RETENTION_DAYS}）"
+    ),
+    before: Optional[str] = typer.Option(
+        None, "--before", help="显式截止时间（YYYY-MM-DD 或 ISO datetime）"
+    ),
+    start_at: Optional[str] = typer.Option(
+        None, "--start", help="只归档该时间之后的数据（YYYY-MM-DD 或 ISO datetime）"
+    ),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="只归档指定源"),
+    batch_size: int = typer.Option(100, "--batch-size", min=10, max=5000, help="每批行数"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只统计候选行，不迁移"),
+    restart: bool = typer.Option(False, "--restart", help="忽略断点，从头开始"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="输出 DEBUG 日志"),
+) -> None:
+    """把冷结构化数据与原始响应迁移到按时间分片的归档库。
+
+    默认不启用归档；只有显式执行本命令才会产生归档设置。归档设置写入主库后，
+    ``db stats`` / ``Database.query_records`` 会自动跨库关联，无需手动切换。
+    """
+
+    logger = configure_logging(verbose)
+    if not db_path.exists():
+        typer.secho(f"数据库不存在: {db_path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    if before is not None and days is not None:
+        typer.secho("--before 与 --days 不能同时使用", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    retention_days = days if days is not None else DEFAULT_RETENTION_DAYS
+    if before is not None:
+        try:
+            parsed = datetime.fromisoformat(before)
+        except ValueError as exc:
+            typer.secho(f"无法解析 --before: {before}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+        if parsed.tzinfo is None:
+            cutoff = parsed
+        else:
+            cutoff = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            days=retention_days
+        )
+
+    start_value: datetime | None = None
+    if start_at is not None:
+        try:
+            parsed_start = datetime.fromisoformat(start_at)
+        except ValueError as exc:
+            typer.secho(f"无法解析 --start: {start_at}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+        start_value = (
+            parsed_start
+            if parsed_start.tzinfo is None
+            else parsed_start.astimezone(timezone.utc).replace(tzinfo=None)
+        )
+        if start_value >= cutoff:
+            typer.secho("--start 必须早于归档截止时间", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2)
+
+    database = Database(db_path)
+    try:
+        database.init()
+        summary = archive_cold_data(
+            database,
+            archive_dir=archive_dir,
+            cold_raw_dir=archive_dir / "raw",
+            cutoff=cutoff,
+            source=source,
+            start=start_value,
+            retention_days=retention_days,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            restart=restart,
+            logger=logger,
+        )
+    except StoreError as exc:
+        typer.secho(f"归档失败: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    finally:
+        database.close()
+
+    mode = "（dry-run，未迁移）" if summary.dry_run else ""
+    typer.echo(
+        f"归档完成{mode} scope={summary.scope} cutoff={summary.cutoff.isoformat()} "
+        f"records={summary.records_archived} raw={summary.raw_archived} "
+        f"batches={summary.batches} max_lock_ms={summary.max_lock_ms} "
+        f"resumed={str(summary.resumed).lower()} integrity_ok={str(summary.integrity_ok).lower()}"
+    )
+    if not summary.dry_run:
+        typer.echo(f"archive_dir={summary.archive_dir} cold_raw_dir={summary.cold_raw_dir}")
+
 
 
 @app.command("serve-mock")
