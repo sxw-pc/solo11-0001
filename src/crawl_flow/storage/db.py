@@ -1,12 +1,12 @@
-"""SQLite 持久化：建表、幂等 upsert、统计查询。"""
+"""SQLite 持久化：建表、幂等 upsert、统计查询、只读差异快照。"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, func, select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -26,6 +26,10 @@ RECORD_UPDATE_FIELDS = (
 )
 
 RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+
+# dry-run 差异对比允许查询的标准字段（与 config.ALLOWED_DIFF_FIELDS 保持一致）。
+DIFF_QUERY_FIELDS = ("title", "category", "tags", "published_at", "content", "url")
+DIFF_CHUNK_SIZE = 500
 
 
 def _utcnow() -> datetime:
@@ -115,6 +119,70 @@ class Database:
             if source is not None:
                 statement = statement.where(RecordRow.source == source)
             return int(session.execute(statement).scalar_one())
+
+    def fetch_source_record_ids(self, source: str) -> list[str]:
+        """只读查询某源的全部 ``external_id``，用于发现存量缺失。
+
+        单条短查询，不做写事务，也不加锁；调用方应立即关闭结果。
+        """
+
+        try:
+            with Session(self.engine) as session:
+                rows = session.execute(
+                    select(RecordRow.external_id).where(RecordRow.source == source)
+                )
+                return [str(row) for row in rows.scalars()]
+        except SQLAlchemyError as exc:
+            raise StoreError(f"存量 ID 查询失败 source={source} error={exc}") from exc
+
+    def fetch_diff_snapshot(
+        self,
+        source: str,
+        external_ids: Sequence[str],
+        fields: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        """批量读取存量记录用于差异对比。
+
+        - ``external_ids`` 按 :data:`DIFF_CHUNK_SIZE` 分块，避免超长 SQL。
+        - 只 SELECT 需要的对比字段，不读取 ``id`` / 时间戳等无关列。
+        - 每次查询独立短会话并在 ``finally`` 中立即关闭，不持有长事务。
+
+        返回 ``{external_id: {field: value}}``；不存在的 ID 不会出现在结果里。
+        """
+
+        if not external_ids or not fields:
+            return {}
+        unknown = [name for name in fields if name not in DIFF_QUERY_FIELDS]
+        if unknown:
+            raise StoreError(f"不支持的对比字段: {', '.join(unknown)}")
+
+        columns = [RecordRow.external_id] + [getattr(RecordRow, name) for name in fields]
+        snapshot: dict[str, dict[str, Any]] = {}
+        ids = [str(item) for item in external_ids]
+        try:
+            for start in range(0, len(ids), DIFF_CHUNK_SIZE):
+                chunk = ids[start : start + DIFF_CHUNK_SIZE]
+                session = Session(self.engine)
+                try:
+                    rows = session.execute(
+                        select(*columns).where(
+                            RecordRow.source == source,
+                            RecordRow.external_id.in_(chunk),
+                        )
+                    ).all()
+                    for row in rows:
+                        mapping = row._mapping
+                        external_id = str(mapping[RecordRow.external_id])
+                        snapshot[external_id] = {
+                            name: mapping[getattr(RecordRow, name)] for name in fields
+                        }
+                finally:
+                    session.close()
+        except SQLAlchemyError as exc:
+            raise StoreError(
+                f"存量记录批量查询失败 source={source} error={exc}"
+            ) from exc
+        return snapshot
 
     def count_raw(self, source: str | None = None, status: str | None = None) -> int:
         with Session(self.engine) as session:

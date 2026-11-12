@@ -6,14 +6,15 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, Sequence
 
 from crawl_flow.config import SourceConfig
 from crawl_flow.errors import FetchError, ParseError
 from crawl_flow.fetch.client import Fetcher
 from crawl_flow.fetch.types import FetchResult
-from crawl_flow.models import RawRecord
+from crawl_flow.models import RawRecord, Record
 from crawl_flow.observability.logging import log_item
+from crawl_flow.pipeline.diff import DiffReport, compare_snapshot
 from crawl_flow.pipeline.normalize import normalize_record
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
 from crawl_flow.storage.db import Database
@@ -43,6 +44,8 @@ class RunSummary:
     skipped: int = 0
     elapsed_ms: int = 0
     results: list[ItemOutcome] = field(default_factory=list)
+    # 仅在 dry-run 且显式开启对比时非空，未开启时保持 None 以兼容原有行为。
+    diff: DiffReport | None = None
 
 
 def run_source(
@@ -53,12 +56,17 @@ def run_source(
     fetcher: Fetcher | None = None,
     limit: int | None = None,
     dry_run: bool = False,
+    diff_fields: Sequence[str] | None = None,
     logger: logging.Logger | None = None,
 ) -> RunSummary:
     """采集一个源。
 
     列表页请求/解析失败会抛出异常并终止本轮；单条详情失败只记录并继续。
     ``limit`` 限制处理的条数，超出部分记为 skipped（仍会翻完列表页以便计数）。
+
+    ``diff_fields`` 非空且处于 dry-run 时，会在采集结束后批量读取存量记录并
+    生成 :class:`DiffReport`；该过程只读，不产生 raw 文件或数据库写入。
+    未提供 ``diff_fields`` 时行为与既有实现完全一致。
     """
 
     log = logger or logging.getLogger(LOGGER_NAME)
@@ -68,11 +76,15 @@ def run_source(
     summary = RunSummary(source=source.name)
     started = time.perf_counter()
     seen: set[str] = set()
+    observed: set[str] = set()
+    collected: list[Record] = []
+    compare_enabled = dry_run and bool(diff_fields)
     processed = 0
 
     try:
         for page in adapter.iter_list_pages():
             for item in page.items:
+                observed.add(item.external_id)
                 if item.external_id in seen:
                     summary.skipped += 1
                     log_item(log, source.name, item.external_id, "skipped", 0)
@@ -90,6 +102,7 @@ def run_source(
                     raw_store=raw_store,
                     dry_run=dry_run,
                     logger=log,
+                    on_success=collected.append if compare_enabled else None,
                 )
                 summary.results.append(outcome)
                 if outcome.status == "ok":
@@ -99,6 +112,15 @@ def run_source(
     finally:
         if owns_fetcher:
             active_fetcher.close()
+
+    if compare_enabled:
+        summary.diff = _build_diff_report(
+            source.name,
+            collected=collected,
+            observed=observed,
+            fields=list(diff_fields or ()),
+            db=db,
+        )
 
     summary.elapsed_ms = int((time.perf_counter() - started) * 1000)
     log.info(
@@ -113,6 +135,32 @@ def run_source(
     return summary
 
 
+def _build_diff_report(
+    source_name: str,
+    *,
+    collected: list[Record],
+    observed: set[str],
+    fields: list[str],
+    db: Database,
+) -> DiffReport:
+    """批量拉取存量记录并生成对比报告（只读，不开启写事务）。"""
+
+    started = time.perf_counter()
+    existing_ids = db.fetch_source_record_ids(source_name)
+    fetched_ids = [record.external_id for record in collected]
+    snapshot = db.fetch_diff_snapshot(source_name, fetched_ids, fields)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return compare_snapshot(
+        source=source_name,
+        fetched=collected,
+        stored=snapshot,
+        stored_ids=existing_ids,
+        observed_ids=observed,
+        fields=fields,
+        elapsed_ms=elapsed_ms,
+    )
+
+
 def process_item(
     adapter: SourceAdapter,
     item: ListItem,
@@ -121,8 +169,13 @@ def process_item(
     raw_store: RawStore,
     dry_run: bool,
     logger: logging.Logger,
+    on_success: Callable[[Record], None] | None = None,
 ) -> ItemOutcome:
-    """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。"""
+    """抓取并处理单条详情；FetchError/ParseError 被隔离为 failed。
+
+    ``on_success`` 只在归一化成功后被调用（写入数据库也发生在之后），
+    用于 dry-run 差异对比收集本次结果，失败条目不会进入对比集合。
+    """
 
     source = adapter.source
     started = time.perf_counter()
@@ -203,6 +256,9 @@ def process_item(
             )
         )
         db.upsert_record(record)
+
+    if on_success is not None:
+        on_success(record)
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log_item(logger, source.name, item.external_id, "ok", elapsed_ms)

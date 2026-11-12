@@ -48,9 +48,16 @@ crawl-flow db stats
 
 ```bash
 crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库
+crawl-flow run --source demo_api --dry-run --diff   # dry-run 并对比存量数据
 crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
 crawl-flow db stats --db data/crawl.db
 ```
+
+差异对比（`--diff`，必须配合 `--dry-run`）会在采集结束后批量拉取该源存量记录，
+输出**新增 / 修改 / 无变化 / 异常**四类统计与字段变更摘要。默认只对比
+`title`、`content`、`published_at`，可在 `sources.yaml` 顶层用
+`diff.compare_fields` 扩展，或用 `--diff-fields` 临时覆盖；对比全程只读，
+不产生 raw 文件或数据库写入，且不会打印正文内容（仅显示长度变化）。
 
 ## 目录速览
 
