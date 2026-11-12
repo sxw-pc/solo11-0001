@@ -42,9 +42,25 @@ class SourceConfig(BaseModel):
     enabled: bool = True
     page_size: int = Field(default=5, ge=1, le=100)
     timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    # 请求头规则：不配置时沿用 Fetcher 默认值；headers 会覆盖同名默认头。
+    user_agent: str | None = Field(default=None, min_length=1)
+    headers: dict[str, str] = Field(default_factory=dict)
     list_path: str | None = None
     detail_path: str | None = None
     field_map: FieldMapping = Field(default_factory=FieldMapping)
+    # 健康探测配置；probe_timeout_seconds 省略时默认取 timeout_seconds 的一半。
+    probe_enabled: bool = False
+    probe_timeout_seconds: float | None = Field(default=None, gt=0, le=120)
+
+    @field_validator("headers")
+    @classmethod
+    def _check_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        for key, header_value in value.items():
+            if not str(key).strip():
+                raise ValueError("headers 的键不能为空")
+            if "\n" in str(key) or "\n" in str(header_value):
+                raise ValueError("headers 的键和值不能包含换行")
+        return value
 
     @field_validator("base_url")
     @classmethod
@@ -63,6 +79,13 @@ class SourceConfig(BaseModel):
         if "{id}" not in self.detail_path:
             raise ValueError("detail_path 必须包含 {id} 占位符")
         return self
+
+    def effective_probe_timeout(self) -> float:
+        """探测超时：显式配置优先，否则为正常采集超时的一半。"""
+
+        if self.probe_timeout_seconds is not None:
+            return self.probe_timeout_seconds
+        return self.timeout_seconds / 2
 
 
 def load_sources(path: str | Path) -> list[SourceConfig]:

@@ -16,6 +16,7 @@ from crawl_flow.models import RawRecord
 from crawl_flow.observability.logging import log_item
 from crawl_flow.pipeline.normalize import normalize_record
 from crawl_flow.sources import ListItem, SourceAdapter, create_adapter
+from crawl_flow.sources.base import build_fetcher
 from crawl_flow.storage.db import Database
 from crawl_flow.storage.raw_store import RawStore
 
@@ -63,7 +64,7 @@ def run_source(
 
     log = logger or logging.getLogger(LOGGER_NAME)
     owns_fetcher = fetcher is None
-    active_fetcher = fetcher or Fetcher(timeout=source.timeout_seconds)
+    active_fetcher = fetcher or build_fetcher(source)
     adapter = create_adapter(source, active_fetcher)
     summary = RunSummary(source=source.name)
     started = time.perf_counter()
@@ -184,6 +185,7 @@ def process_item(
         )
 
     if not dry_run:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
         raw_path = raw_store.save(
             source=source.name,
             external_id=item.external_id,
@@ -200,6 +202,7 @@ def process_item(
                 status="ok",
                 error=None,
                 raw_path=raw_path,
+                elapsed_ms=elapsed_ms,
             )
         )
         db.upsert_record(record)
@@ -241,6 +244,7 @@ def _fail(
                 status="failed",
                 error=summary,
                 raw_path=raw_path,
+                elapsed_ms=elapsed_ms,
             )
         )
     log_item(logger, source_name, item.external_id, "failed", elapsed_ms)

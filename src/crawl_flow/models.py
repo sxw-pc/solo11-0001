@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import (
     DateTime,
+    Float,
     Index,
     Integer,
     JSON,
@@ -18,6 +19,15 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 RawStatus = Literal["ok", "failed"]
+HealthRating = Literal["healthy", "degraded", "unhealthy"]
+ProbeOutcome = Literal[
+    "ok",
+    "timeout",
+    "transport_error",
+    "http_4xx",
+    "http_5xx",
+    "parse_error",
+]
 
 
 class Record(BaseModel):
@@ -49,6 +59,40 @@ class RawRecord(BaseModel):
     status: RawStatus
     error: str | None = None
     raw_path: str | None = None
+    elapsed_ms: int = 0
+
+    @field_validator("error")
+    @classmethod
+    def _trim_error(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        return trimmed or None
+
+
+class SourceHealthStats(BaseModel):
+    """从 ``raw_records`` 汇总出的历史健康信号，用于探测评级。"""
+
+    total: int = 0
+    failed: int = 0
+    failure_rate: float | None = None
+    avg_response_ms: float | None = None
+
+
+class ProbeRecord(BaseModel):
+    """一次健康探测的结果，对应 ``probe_records`` 表（仅显式持久化时写入）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(min_length=1)
+    probed_at: datetime
+    outcome: ProbeOutcome
+    rating: HealthRating
+    http_status: int | None = None
+    elapsed_ms: int = 0
+    history_failure_rate: float | None = None
+    avg_response_ms: float | None = None
+    error: str | None = None
 
     @field_validator("error")
     @classmethod
@@ -81,6 +125,7 @@ class RawRecordRow(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class RecordRow(Base):
@@ -103,3 +148,25 @@ class RecordRow(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ProbeRecordRow(Base):
+    """``probe_records``：健康探测历史，追加写入，不参与正常采集幂等。"""
+
+    __tablename__ = "probe_records"
+    __table_args__ = (
+        Index("ix_probe_records_source_probed_at", "source", "probed_at"),
+        Index("ix_probe_records_rating", "rating"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    probed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    rating: Mapped[str] = mapped_column(String(16), nullable=False)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    history_failure_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_response_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+

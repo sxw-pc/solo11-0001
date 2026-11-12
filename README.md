@@ -50,7 +50,19 @@ crawl-flow db stats
 crawl-flow run --all --dry-run          # 解析但不写 raw 与数据库
 crawl-flow run --source demo_api_flaky # 详情一律 500 的演练源
 crawl-flow db stats --db data/crawl.db
+crawl-flow probe --source demo_api      # 只请求列表第 1 页，输出健康评级
+crawl-flow probe --all --persist        # 额外把探测结果写入 probe_records 表
+crawl-flow db health --db data/crawl.db # 查看历史探测记录
+crawl-flow run --source demo_api --probe # 采集前探测（不改变采集流程）
 ```
+
+## 源健康探测
+
+`probe` 只请求列表第一页即完成可用性校验，不抓详情、不落 raw、不写业务库；
+默认超时为正常采集的一半，UA、请求头与重试规则沿用现有 `Fetcher`。
+评级规则：2xx/3xx 且历史正常为 `healthy`；超时 / 5xx / 传输错误 / 解析失败为
+`degraded`；4xx 永久失效或历史错误率过高为 `unhealthy`。只有 `--persist`
+时才写入独立的 `probe_records` 表。
 
 ## 目录速览
 

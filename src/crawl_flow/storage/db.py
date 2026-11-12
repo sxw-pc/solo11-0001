@@ -12,7 +12,16 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from crawl_flow.errors import StoreError
-from crawl_flow.models import Base, RawRecord, RawRecordRow, Record, RecordRow
+from crawl_flow.models import (
+    Base,
+    ProbeRecord,
+    ProbeRecordRow,
+    RawRecord,
+    RawRecordRow,
+    Record,
+    RecordRow,
+    SourceHealthStats,
+)
 
 RECORD_UPDATE_FIELDS = (
     "title",
@@ -25,7 +34,20 @@ RECORD_UPDATE_FIELDS = (
     "updated_at",
 )
 
-RAW_UPDATE_FIELDS = ("url", "http_status", "fetched_at", "status", "error", "raw_path")
+RAW_UPDATE_FIELDS = (
+    "url",
+    "http_status",
+    "fetched_at",
+    "status",
+    "error",
+    "raw_path",
+    "elapsed_ms",
+)
+
+# 兼容旧库：``create_all`` 不会给已存在的表补列，这里显式补齐新增列。
+_RAW_RECORD_COLUMNS: dict[str, str] = {
+    "elapsed_ms": "INTEGER NOT NULL DEFAULT 0",
+}
 
 
 def _utcnow() -> datetime:
@@ -43,12 +65,31 @@ class Database:
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def init(self) -> None:
-        """创建两张表及索引（幂等）。"""
+        """创建所有表及索引（幂等），并为旧库补齐新增列。"""
 
         try:
             Base.metadata.create_all(self.engine)
+            self._ensure_raw_record_columns()
         except SQLAlchemyError as exc:
             raise StoreError(f"建表失败 db={self.path} error={exc}") from exc
+
+    def _ensure_raw_record_columns(self) -> None:
+        from sqlalchemy import inspect, text
+
+        inspector = inspect(self.engine)
+        if "raw_records" not in inspector.get_table_names():
+            return
+        existing = {column["name"] for column in inspector.get_columns("raw_records")}
+        missing = [
+            (name, ddl)
+            for name, ddl in _RAW_RECORD_COLUMNS.items()
+            if name not in existing
+        ]
+        if not missing:
+            return
+        with self.engine.begin() as connection:
+            for name, ddl in missing:
+                connection.execute(text(f"ALTER TABLE raw_records ADD COLUMN {name} {ddl}"))
 
     def upsert_record(self, record: Record) -> None:
         """按 (source, external_id) 幂等写入；重复采集只更新内容与时间戳。"""
@@ -93,6 +134,7 @@ class Database:
             "status": raw.status,
             "error": raw.error,
             "raw_path": raw.raw_path,
+            "elapsed_ms": raw.elapsed_ms,
         }
         try:
             with self._session_factory() as session:
@@ -124,6 +166,86 @@ class Database:
             if status is not None:
                 statement = statement.where(RawRecordRow.status == status)
             return int(session.execute(statement).scalar_one())
+
+    def health_stats(self, source: str) -> SourceHealthStats:
+        """按源汇总 ``raw_records`` 的历史错误率与平均响应时间。
+
+        没有历史数据时返回空统计（``failure_rate`` / ``avg_response_ms`` 均为
+        ``None``），评级不会被历史信号收紧。
+        """
+
+        with Session(self.engine) as session:
+            total = session.execute(
+                select(func.count())
+                .select_from(RawRecordRow)
+                .where(RawRecordRow.source == source)
+            ).scalar_one()
+            failed = session.execute(
+                select(func.count())
+                .select_from(RawRecordRow)
+                .where(RawRecordRow.source == source, RawRecordRow.status == "failed")
+            ).scalar_one()
+            avg_elapsed = session.execute(
+                select(func.avg(RawRecordRow.elapsed_ms))
+                .select_from(RawRecordRow)
+                .where(RawRecordRow.source == source, RawRecordRow.elapsed_ms > 0)
+            ).scalar_one()
+
+        total_int = int(total or 0)
+        failed_int = int(failed or 0)
+        return SourceHealthStats(
+            total=total_int,
+            failed=failed_int,
+            failure_rate=(failed_int / total_int) if total_int else None,
+            avg_response_ms=float(avg_elapsed) if avg_elapsed is not None else None,
+        )
+
+    def insert_probe(self, probe: ProbeRecord) -> None:
+        """追加一条健康探测记录（``probe_records`` 只增不改）。"""
+
+        values = {
+            "source": probe.source,
+            "probed_at": probe.probed_at,
+            "outcome": probe.outcome,
+            "rating": probe.rating,
+            "http_status": probe.http_status,
+            "elapsed_ms": probe.elapsed_ms,
+            "history_failure_rate": probe.history_failure_rate,
+            "avg_response_ms": probe.avg_response_ms,
+            "error": probe.error,
+        }
+        try:
+            with self._session_factory() as session:
+                session.add(ProbeRecordRow(**values))
+                session.commit()
+        except SQLAlchemyError as exc:
+            raise StoreError(
+                f"probe_records 写入失败 source={probe.source} error={exc}"
+            ) from exc
+
+    def probe_history(self, source: str | None = None) -> list[dict[str, Any]]:
+        """读取探测历史（按探测时间升序），供 ``db health`` 展示或测试断言。"""
+
+        with Session(self.engine) as session:
+            statement = select(ProbeRecordRow)
+            if source is not None:
+                statement = statement.where(ProbeRecordRow.source == source)
+            statement = statement.order_by(ProbeRecordRow.probed_at, ProbeRecordRow.id)
+            rows = list(session.execute(statement).scalars())
+        return [
+            {
+                "source": row.source,
+                "probed_at": row.probed_at,
+                "outcome": row.outcome,
+                "rating": row.rating,
+                "http_status": row.http_status,
+                "elapsed_ms": row.elapsed_ms,
+                "history_failure_rate": row.history_failure_rate,
+                "avg_response_ms": row.avg_response_ms,
+                "error": row.error,
+            }
+            for row in rows
+        ]
 
     def stats(self) -> dict[str, Any]:
         """按源汇总 records 数量、raw 成功/失败数量与最近抓取时间。"""

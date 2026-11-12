@@ -1,5 +1,9 @@
 # crawl-flow 源配置
 # 每个源必须包含 name / type / base_url；page_size 只对 api 类型生效。
+# 可选项（示例见 demo_api）：
+#   user_agent / headers            覆盖 Fetcher 默认 UA 与请求头
+#   probe_enabled                   未传 --probe/--no-probe 时是否在 run 前探测
+#   probe_timeout_seconds           探测超时；省略时取 timeout_seconds 的一半
 sources:
   - name: demo_api
     type: api
@@ -7,6 +11,8 @@ sources:
     enabled: true
     page_size: 5
     timeout_seconds: 10
+    # 该源默认参与 run 前置探测；探测只请求列表第 1 页，不写 raw 与业务表。
+    probe_enabled: true
     # 默认路径分别是 /api/items 与 /api/items/{id}，这里显式写出便于阅读
     list_path: /api/items
     detail_path: /api/items/{id}

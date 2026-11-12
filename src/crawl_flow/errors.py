@@ -18,10 +18,18 @@ class ConfigError(CrawlFlowError):
 class FetchError(CrawlFlowError):
     """网络请求失败：连接异常、超时、非预期 HTTP 状态。"""
 
-    def __init__(self, message: str, *, url: str = "", status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        url: str = "",
+        status_code: int | None = None,
+        timed_out: bool = False,
+    ) -> None:
         super().__init__(message)
         self.url = url
         self.status_code = status_code
+        self.timed_out = timed_out
 
 
 class ParseError(CrawlFlowError):

@@ -9,10 +9,20 @@ from urllib.parse import quote
 
 from crawl_flow.config import SourceConfig
 from crawl_flow.errors import FetchError, ParseError
-from crawl_flow.fetch.client import Fetcher
+from crawl_flow.fetch.client import DEFAULT_USER_AGENT, Fetcher
 from crawl_flow.fetch.types import FetchResult
 
 MAX_PAGES = 500
+
+
+def build_fetcher(source: SourceConfig, *, timeout: float | None = None) -> Fetcher:
+    """按源配置构建 Fetcher，复用 ``timeout_seconds``、``user_agent`` 与 ``headers``。"""
+
+    return Fetcher(
+        timeout=source.timeout_seconds if timeout is None else timeout,
+        user_agent=source.user_agent or DEFAULT_USER_AGENT,
+        headers=source.headers,
+    )
 
 
 def build_url(base_url: str, path: str) -> str:
@@ -72,6 +82,18 @@ class SourceAdapter(ABC):
 
         return self.fetcher.get(self.detail_url(external_id))
 
+    def fetch_list_page(self, page: int, *, timeout: float | None = None) -> FetchResult:
+        """请求一页列表；``timeout`` 可覆盖客户端超时（健康探测使用）。
+
+        健康探测与正常翻页都走这一个方法，保证 URL、参数与请求头规则完全一致。
+        """
+
+        return self.fetcher.get(
+            self.list_url(page),
+            params=self.list_params(page),
+            timeout=timeout,
+        )
+
     def iter_list_pages(self) -> Iterator[ListPage]:
         """从第 1 页开始翻页，遇到空页终止。
 
@@ -81,7 +103,7 @@ class SourceAdapter(ABC):
 
         page = 1
         while page <= MAX_PAGES:
-            result = self.fetcher.get(self.list_url(page), params=self.list_params(page))
+            result = self.fetch_list_page(page)
             if result.status_code >= 400:
                 raise FetchError(
                     f"列表页请求失败 source={self.source.name} page={page} "

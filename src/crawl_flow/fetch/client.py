@@ -1,8 +1,10 @@
-"""httpx 封装：统一超时、User-Agent 与一次固定重试。"""
+"""httpx 封装：统一超时、User-Agent/请求头与一次固定重试。"""
 
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
+from typing import Any
 
 import httpx
 
@@ -26,22 +28,45 @@ class Fetcher:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         retries: int = 1,
         user_agent: str = DEFAULT_USER_AGENT,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         self._retries = max(0, retries)
+        merged_headers: dict[str, str] = {
+            "User-Agent": user_agent,
+            "Accept": "*/*",
+        }
+        if headers:
+            # 源配置里的请求头覆盖默认值；UA 也可以在这里显式覆盖。
+            merged_headers.update({str(key): str(value) for key, value in headers.items()})
         self._client = httpx.Client(
             timeout=timeout,
             follow_redirects=True,
-            headers={"User-Agent": user_agent, "Accept": "*/*"},
+            headers=merged_headers,
         )
 
-    def get(self, url: str, params: dict[str, object] | None = None) -> FetchResult:
-        """发起 GET，传输层失败抛 :class:`FetchError`，HTTP 错误码正常返回。"""
+    def get(
+        self,
+        url: str,
+        params: dict[str, object] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> FetchResult:
+        """发起 GET，传输层失败抛 :class:`FetchError`，HTTP 错误码正常返回。
+
+        ``timeout`` 为单请求覆盖值；不传时沿用客户端超时。探测会传入源超时的
+        一半，但仍然复用本客户端、UA、请求头与同一套重试规则。
+        """
 
         last_error: Exception | None = None
         for attempt in range(self._retries + 1):
             started = time.perf_counter()
+            request_kwargs: dict[str, Any] = {}
+            if params is not None:
+                request_kwargs["params"] = params
+            if timeout is not None:
+                request_kwargs["timeout"] = timeout
             try:
-                response = self._client.get(url, params=params)
+                response = self._client.get(url, **request_kwargs)
             except httpx.HTTPError as exc:
                 last_error = exc
                 if attempt < self._retries:
@@ -49,6 +74,7 @@ class Fetcher:
                 raise FetchError(
                     f"请求失败 url={url} error={exc.__class__.__name__}: {exc}",
                     url=url,
+                    timed_out=isinstance(exc, httpx.TimeoutException),
                 ) from exc
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             return FetchResult(
